@@ -1,0 +1,92 @@
+# Default configuration for shell-identifier.
+# Copy this file and pass it with --config to override any value.
+
+spatial:
+  # Metric CRS used for all distance/area work. "auto" picks Australian Albers
+  # for the datum of the inputs (EPSG:9473 for GDA2020, EPSG:3577 for GDA94).
+  metric_crs: auto
+  # Addresses that fall outside every base parcel (e.g. geocoded in a road)
+  # are snapped to the nearest base parcel within this distance.
+  parcel_snap_distance_m: 5.0
+  # Geocodes closer than this are treated as "stacked" (same point).
+  stacked_tolerance_m: 0.5
+  # Search radius for nested sub-addresses that landed on neighbouring parcels.
+  offparcel_radius_m: 150.0
+  # Buildings smaller than this (sheds, garages) are not counted as dwellings.
+  min_dwelling_building_area_m2: 35.0
+  # Storey height used when only a roof height is available.
+  storey_height_m: 3.1
+
+cadastre:
+  # Use only the base representation (base_parcel = "Yes"). If the attribute is
+  # missing or empty, parcels of type "Lot" are used instead.
+  use_base_parcels: true
+
+buildings:
+  # How an address is tied to a building: spatial containment of its geocode,
+  # then the Geoscape building_address link table as a fallback.
+  use_building_address_link: true
+  link_min_confidence: 50
+
+features:
+  # Weight given to each kind of nested sub-address when counting "children".
+  child_weights:
+    dwelling: 1.0
+    commercial: 1.0
+    level: 1.0
+    structure: 1.0
+    secondary: 0.5
+    ancillary: 0.25
+  # Building/strata balance checks only apply to small groups, where one more or
+  # one fewer dwelling changes the answer. Large complexes are decided by children.
+  small_group_max_dwellings: 6
+  # Legal parcel id patterns (regex, matched against G-NAF LEGAL_PARCEL_ID).
+  legal_common_property_patterns:
+    - '^CP[/\\]'
+    - 'COMMON PROPERTY'
+  legal_strata_lot_patterns:
+    - '^\d+[A-Z]?[/\\](SP|SSP|BUP|GTP|CTS|STRATA)'
+
+scoring:
+  intercept: -1.0
+  # Log-odds contribution per unit of each feature. Positive = more shell-like.
+  weights:
+    log_children: 2.2
+    single_child: -1.0
+    only_secondary_children: -2.0
+    only_ancillary_children: -2.0
+    log_range_children: 2.0
+    log_offparcel_children: 1.2
+    stacked_children: 1.0
+    suffix_base: 0.4
+    suffix_multi_variant: 0.8
+    suffix_single_variant: -1.2
+    strata_matches_siblings: 1.5
+    strata_exceeds_siblings: -2.0
+    building_surplus: -0.8
+    building_deficit: 0.8
+    own_building: -2.0
+    outside_buildings: 0.7
+    multistorey: 1.0
+    vertical_strata: 0.8
+    parcel_level_geocode: 0.4
+    gnaf_primary_linked: 2.0
+    gnaf_primary_flag_only: 0.5
+    gnaf_secondary: -1.5
+    legal_common_property: 1.5
+    legal_strata_lot: -1.0
+    vanity_name: 0.3
+    leaf_subaddress: -4.0
+    leaf_street_address: -3.0
+    single_address_parcel: -2.0
+    has_parent: -0.5
+    alias: -1.5
+  # Probability bands -> class labels (lower bound inclusive).
+  classes:
+    - [0.80, SHELL]
+    - [0.60, LIKELY_SHELL]
+    - [0.40, UNCERTAIN]
+    - [0.20, LIKELY_NOT_SHELL]
+    - [0.00, NOT_SHELL]
+  # Number of reasons written per address.
+  max_reasons: 4
