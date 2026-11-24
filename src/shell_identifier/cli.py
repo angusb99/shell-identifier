@@ -288,7 +288,7 @@ def _dataset_args(p: argparse.ArgumentParser, labels: bool = False) -> None:
                    help="optional building_cadastre links")
     if labels:
         g.add_argument("--labelled-asset", "--labels", dest="labelled_asset",
-                       help="address-level PD / out-of-scope labels")
+                       help="the PD-labelled addresses (every other address is not PD)")
     g.add_argument("--counts", help="optional parcel dwelling counts (parcel_pid, n_dwellings)")
     g.add_argument("--table", action="append", metavar="ROLE=NAME",
                    help="table / layer name for a dataset, e.g. --table ds_asset=address_2026 (repeatable)")
@@ -350,7 +350,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--out", default="results")
     s.set_defaults(func=cmd_run)
 
-    d = sub.add_parser("dwellings", help="count-constrained dwelling model trained on PD / out-of-scope labels")
+    d = sub.add_parser("dwellings", help="count-constrained dwelling model trained on PD labels")
     dsub = d.add_subparsers(dest="dwellings_command", required=True)
     s = dsub.add_parser("verify", help="fit on labelled parcels; move misplaced PD labels; find primary shells")
     _dataset_args(s, labels=True)

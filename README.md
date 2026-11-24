@@ -15,7 +15,7 @@ Scores every address on a cadastral parcel for the likelihood that it is a **she
 There are two approaches:
 
 - **Shell scoring** (`shell-identifier run`): an expert-weighted model that needs no labels.
-- **Dwelling model** (`shell-identifier dwellings …`): learns from PD / out-of-scope labels whose per-parcel count is right but whose choice of address may be wrong. It decides which addresses are the dwellings, moves misplaced labels, and names the primary shell. See [Dwelling model from labelled data](#dwelling-model-from-labelled-data).
+- **Dwelling model** (`shell-identifier dwellings …`): learns from PD address labels (every other address is not PD) whose per-parcel count is right but whose choice of address may be wrong. It decides which addresses are the dwellings, moves misplaced labels, and names the primary shell. See [Dwelling model from labelled data](#dwelling-model-from-labelled-data).
 
 It uses three data products: **G-NAF**, **Geoscape Cadastre** and **Geoscape Buildings**, plus the PD labels for the dwelling model. The inputs can be passed as polars LazyFrames (see [From polars LazyFrames](#from-polars-lazyframes)), or located by path and table name in a small YAML file (see [Your datasets](#your-datasets)). All processing up to the model is done in **polars**, with vectorised shapely for the spatial joins. It can also read free-text address strings with a rule-based parser. There is no LLM and no libpostal. The scoring is a transparent log-odds model: every probability breaks down into named reasons, such as `12 nested sub-address(es) (12 dwelling) [+5.6]; G-NAF primary with 12 linked secondaries [+2.0]`.
 
@@ -64,7 +64,7 @@ Run the tests with `.venv/Scripts/python -m pytest`.
 
 ## From polars LazyFrames
 
-The most direct way in: read the four inputs yourself and pass the frames. Only the columns that are needed are collected.
+The most direct way in: read the four inputs yourself and pass the frames. Only the columns that are needed are collected. For a step-by-step walkthrough, from preparing the inputs to reading the results and finding insights, see the [run guide](docs/run_guide.md).
 
 ```python
 import polars as pl
@@ -100,7 +100,7 @@ The pipeline reads four datasets. Their names are placeholders for your real tab
 
 | dataset | what it holds | key columns (defaults) |
 |---|---|---|
-| `labelled_asset` | PD / out-of-scope label per address | `address_detail_pid`, `label` |
+| `labelled_asset` | the PD addresses (every other address is not PD) | `address_detail_pid`, optional `label` flag |
 | `ds_asset` | every address, G-NAF fields, one row each | `address_detail_pid`, `longitude`, `latitude`, the G-NAF number / flat / level / street / locality columns, `alias_principal`, `primary_secondary`, `legal_parcel_id`, `geocode_type_code`, `date_retired` |
 | `bld` | Geoscape Buildings footprints | `building_pid`, geometry, `building_area`, `total_floor_area`, `roof_height`, `building_use` |
 | `cad` | Geoscape Cadastre parcels (base + strata) | `cadastre_pid`, geometry, `parcel_type`, `base_parcel`, `strata_type`, strata counts |

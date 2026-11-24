@@ -36,7 +36,7 @@ from .dwellings.labels import labels_from_frame, pd_flag
 
 ROLES = ("labelled_asset", "ds_asset", "bld", "cad", "bld_address", "bld_cadastre", "parcel_counts")
 DESCRIPTIONS = {
-    "labelled_asset": "PD / out-of-scope labels",
+    "labelled_asset": "PD addresses; every other address is not PD",
     "ds_asset": "addresses",
     "bld": "building footprints",
     "cad": "cadastre parcels",

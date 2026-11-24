@@ -84,12 +84,16 @@ def _prepare(ctx: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
 
 
 def _with_labels(s: pl.DataFrame, labels: pl.DataFrame | None) -> pl.DataFrame:
-    """``y`` = 1 for addresses labelled PD and 0 for every other address (-1 throughout without labels)."""
-    s = s.drop([k for k in ("y", "input_label") if k in s.columns])
+    """``pd_label`` = 1 for addresses labelled PD and 0 for every other address (-1 throughout without labels).
+
+    (Not ``y``: that is the address's y coordinate, alongside ``x``.)
+    """
+    s = s.drop([k for k in ("pd_label", "input_label") if k in s.columns])
     if labels is None:
-        return s.with_columns(y=pl.lit(-1, dtype=pl.Int64), input_label=pl.lit(""))
+        return s.with_columns(pd_label=pl.lit(-1, dtype=pl.Int64), input_label=pl.lit(""))
     is_pd = c("address_pid").is_in(labels.filter(c("y") == 1)["address_pid"].cast(pl.Utf8).implode())
-    return s.with_columns(y=is_pd.cast(pl.Int64), input_label=pl.when(is_pd).then(pl.lit("PD")).otherwise(pl.lit("OOS")))
+    return s.with_columns(pd_label=is_pd.cast(pl.Int64),
+                          input_label=pl.when(is_pd).then(pl.lit("PD")).otherwise(pl.lit("OOS")))
 
 
 def verify(ctx: dict, labels: pl.DataFrame, settings: EMSettings | None = None,
@@ -103,17 +107,17 @@ def verify(ctx: dict, labels: pl.DataFrame, settings: EMSettings | None = None,
     """
     s, F = _prepare(ctx)
     s = _with_labels(s, labels)
-    n_pd = int((s["y"] == 1).sum())
+    n_pd = int((s["pd_label"] == 1).sum())
     if not n_pd:
         raise ValueError("no PD label matched an address; check that the label ids are the ds_asset address ids")
     if labels.height > n_pd:
         log(f"{labels.height - n_pd:,} PD labels have an address id that is not in ds_asset and are ignored")
-    k = parcel_counts(s, counts)
+    k = parcel_counts(s.select("parcel_pid", y=c("pd_label")), counts)
     k_map = dict(zip(k["parcel_pid"].to_list(), k["k"].to_list()))
     train = (s["parcel_pid"].is_in(k["parcel_pid"].implode()) & (s["parcel_pid"] != "")).to_numpy()
     if not train.any():
         raise ValueError("no address could be matched to a parcel; check the coordinates and the cadastre")
-    n_pd_parcel = int((s["y"] == 1).filter(pl.Series(train)).sum())
+    n_pd_parcel = int((s["pd_label"] == 1).filter(pl.Series(train)).sum())
     log(f"{int(train.sum()):,} addresses on {k.height:,} parcels ({int((k['k'] > 0).sum()):,} with a PD label); "
         f"{n_pd:,} PD labels, {n_pd - n_pd_parcel:,} of them on addresses outside every parcel; "
         f"all other addresses are taken as not PD")
@@ -127,7 +131,7 @@ def verify(ctx: dict, labels: pl.DataFrame, settings: EMSettings | None = None,
         log(f"{len(dropped)} features have no data (or too little to use) and are left out: {', '.join(dropped)}")
     F_all, F, X = F, F.select([name for name, keep in zip(F.columns, ok) if keep]), X[:, ok]
     parcel = s["parcel_pid"].to_numpy()
-    y = s["y"].to_numpy()
+    y = s["pd_label"].to_numpy()
     em = CountConstrainedEM(settings).fit(X[train], parcel[train], k_map, y[train], log=log)
     prob, post, assigned = np.full(s.height, np.nan), np.full(s.height, np.nan), np.zeros(s.height, dtype=bool)
     prob[train], post[train], assigned[train] = em.oof_prob, em.posterior, em.assigned
@@ -185,7 +189,7 @@ def _finish(s: pl.DataFrame, F: pl.DataFrame) -> dict:
     s = s.with_columns(c("assigned_dwelling").cast(pl.Boolean))
     roles = assign_roles(s, s["assigned_dwelling"].to_numpy())
     s = s.drop([k for k in roles.columns if k != "address_pid" and k in s.columns]).hstack(roles.drop("address_pid"))
-    assigned, y = c("assigned_dwelling"), c("y")
+    assigned, y = c("assigned_dwelling"), c("pd_label")
     rank = pl.when(c("parcel_pid") != "").then(c("posterior").rank("ordinal", descending=True).over("parcel_pid"))
     s = s.with_columns(
         primary_shell_label=lookup(c("primary_shell_pid"), s["address_pid"], s["address_label"], default=""),
@@ -203,7 +207,7 @@ def _finish(s: pl.DataFrame, F: pl.DataFrame) -> dict:
     )
     s = s.with_columns(evidence(s, F))
     verified = s.filter(c("mode") == "verified")
-    moves = (pair_moves(verified.select("parcel_pid", "address_pid", "address_label", "y", "posterior",
+    moves = (pair_moves(verified.select("parcel_pid", "address_pid", "address_label", c("pd_label").alias("y"), "posterior",
                                         assigned=c("assigned_dwelling")))
              if verified.height else pl.DataFrame())
     return {"assignments": s, "parcels": summarise(s), "moves": moves}
@@ -215,7 +219,7 @@ def summarise(s: pl.DataFrame) -> pl.DataFrame:
     out = p.group_by("parcel_pid").agg(
         c("mode").first(),
         pl.len().alias("n_addresses"),
-        (c("y") == 1).sum().alias("labelled_pd"),
+        (c("pd_label") == 1).sum().alias("labelled_pd"),
         assigned.sum().alias("assigned_dwellings"),
         c("dwelling_prob").sum().round(2).alias("expected_dwellings"),
         (c("label_change") == "PD->OOS").sum().alias("n_label_changes"),
@@ -304,8 +308,8 @@ def model_report(result: dict) -> str:
         "# Dwelling model report", "",
         (f"* Parcels checked against their PD count: {v.height:,} "
          f"({int((v['n_addresses'] > 1).sum()):,} with more than one address)"),
-        f"* PD labels: {int((s['y'] == 1).sum()):,}; other addresses (taken as not PD): "
-        f"{int((s['y'] == 0).sum()):,}",
+        f"* PD labels: {int((s['pd_label'] == 1).sum()):,}; other addresses (taken as not PD): "
+        f"{int((s['pd_label'] == 0).sum()):,}",
         f"* PD labels moved to another address: **{int((s['label_change'] == 'PD->OOS').sum()):,}** "
         f"on {int((v['n_label_changes'] > 0).sum()):,} parcels",
         f"* Parcels flagged for review (margin < 0.3): {int(v['review'].sum()):,}",

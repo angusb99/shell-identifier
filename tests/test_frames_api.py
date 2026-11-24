@@ -73,7 +73,15 @@ def test_check_frames_maps_the_layout(frames):
 
 
 def test_verify_frames_end_to_end(frames, synth, tmp_path):
-    res = verify_frames(**frames, settings=FAST, out_dir=tmp_path / "out", gpkg=False, **QUIET)
+    res = verify_frames(**frames, settings=FAST, out_dir=tmp_path / "out", **QUIET)
+    # x / y are the address coordinates, as given (the PD label must not overwrite y)
+    ds = frames["ds_asset"].select(address_pid="ADDRESS_ID", lon="LONGITUDE", lat="LATITUDE").collect()
+    xy = res["assignments"].join(ds, on="address_pid")
+    assert xy.height == ds.height
+    assert (xy["x"] - xy["lon"]).abs().max() < 1e-9 and (xy["y"] - xy["lat"]).abs().max() < 1e-9
+    import pyogrio
+    gpkg = pyogrio.read_dataframe(tmp_path / "out" / "dwelling_assignments.gpkg")
+    assert gpkg.total_bounds[1] >= ds["lat"].min() - 1e-9 and gpkg.total_bounds[3] <= ds["lat"].max() + 1e-9
     m, _ = evaluate_dwellings(res["assignments"].with_columns(pl.col("assigned_dwelling").cast(pl.Utf8)),
                               _truth(synth))
     assert m["wrong_labels"] > 0
