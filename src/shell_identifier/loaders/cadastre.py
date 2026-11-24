@@ -1,4 +1,4 @@
-"""Load Geoscape Cadastre (layer ``cadastre``) and select the base parcels.
+"""Geoscape Cadastre: select the base parcels and their strata counts (polars + shapely).
 
 Geoscape Cadastre stores one single-part polygon per record; multi-part parcels
 appear as several records sharing ``cadastre_pid``. The base representation is
@@ -9,11 +9,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import geopandas as gpd
-import numpy as np
-import pandas as pd
+import polars as pl
+import shapely
 
-from ._io import lower_columns
+from ..frames import c
+from ..geo import Layer, points_within
+from ._io import open_table, rename_lower
 
 # 10-character aliases used by the Shapefile / MapInfo deliveries.
 CADASTRE_ALIASES = {
@@ -26,46 +27,64 @@ CADASTRE_ALIASES = {
 STRATA_COUNT_COLS = ["total_strata_count", "horizontal_strata_count", "vertical_strata_count"]
 
 
-def load_cadastre(path: str | Path, layer: str | None = None, bbox=None, use_base_parcels: bool = True):
-    """Return ``(base_parcels, strata_parcels)`` GeoDataFrames.
+def _upper(df: pl.DataFrame, col: str) -> pl.Expr:
+    if col not in df.columns:
+        return pl.lit("")
+    return c(col).cast(pl.Utf8).fill_null("").str.strip_chars().str.to_uppercase()
 
-    ``base_parcels`` gains ``parcel_pid`` (= ``cadastre_pid``) and strata counts;
-    where the strata count attributes are empty they are derived by counting
-    strata polygons whose representative point falls in the base parcel.
+
+def prepare_cadastre(raw: Layer, use_base_parcels: bool = True) -> tuple[Layer, Layer]:
+    """Split a cadastre layer (lower-case Geoscape names) into ``(base_parcels, strata_parcels)``.
+
+    ``base_parcels`` gains ``parcel_pid`` (= ``cadastre_pid``) and Float64 strata
+    counts; where the count attributes are empty they are derived by counting strata
+    polygons whose representative point falls in the base parcel.
     """
-    gdf = gpd.read_file(path, layer=layer, bbox=bbox, engine="pyogrio")
-    gdf = lower_columns(gdf, CADASTRE_ALIASES)
-    if "cadastre_pid" not in gdf:
-        raise KeyError("cadastre layer has no cadastre_pid / CAD_PID column")
-    ptype = gdf.get("parcel_type", pd.Series("", index=gdf.index)).fillna("").str.upper()
-    base_flag = gdf.get("base_parcel", pd.Series("", index=gdf.index)).fillna("").str.upper()
-
+    df = raw.df
+    if "parcel_pid" not in df.columns:
+        if "cadastre_pid" not in df.columns:
+            raise KeyError(f"cadastre has no cadastre_pid / CAD_PID / parcel_pid column; columns are {df.columns}")
+        df = df.with_columns(parcel_pid=c("cadastre_pid").cast(pl.Utf8))
+    ptype = df.select(_upper(df, "parcel_type")).to_series()
+    base_flag = df.select(_upper(df, "base_parcel")).to_series()
     if use_base_parcels and (base_flag == "YES").any():
-        is_base = base_flag == "YES"
+        is_base = (base_flag == "YES").to_numpy()
     elif (ptype == "LOT").any():
-        is_base = ptype == "LOT"
+        is_base = (ptype == "LOT").to_numpy()
     else:
-        is_base = pd.Series(True, index=gdf.index)
-    is_strata = ptype.isin(["STRATA", "STRATUM"])
+        is_base = (ptype != "ROAD").to_numpy() if (ptype == "ROAD").any() else ptype.is_not_null().to_numpy()
+    is_strata = ptype.is_in(["STRATA", "STRATUM"]).to_numpy()
 
-    base = gdf[is_base].copy()
-    strata = gdf[is_strata].copy()
-    base["parcel_pid"] = base["cadastre_pid"].astype(str)
-    for col in STRATA_COUNT_COLS:
-        base[col] = pd.to_numeric(base[col], errors="coerce") if col in base else np.nan
+    df = df.with_columns(parcel_pid=c("parcel_pid").cast(pl.Utf8),
+                         *[(c(k).cast(pl.Float64, strict=False) if k in df.columns else pl.lit(None, dtype=pl.Float64))
+                           .alias(k) for k in STRATA_COUNT_COLS])
+    layer = Layer(df, raw.geom, raw.crs, dict(raw.meta))
+    base, strata = layer.filter(is_base), layer.filter(is_strata)
 
-    if not strata.empty and base[STRATA_COUNT_COLS].isna().all(axis=1).any():
-        pts = gpd.GeoDataFrame(
-            {"strata_type": strata.get("strata_type", pd.Series("", index=strata.index)).fillna("").str.upper()},
-            geometry=strata.geometry.representative_point(), crs=strata.crs,
+    no_counts = base.df.select(pl.all_horizontal([c(k).is_null() for k in STRATA_COUNT_COLS])).to_series()
+    if len(strata) and no_counts.any():
+        rp = shapely.point_on_surface(strata.geom)
+        i, j = points_within(shapely.get_x(rp), shapely.get_y(rp), base.geom)
+        stype = strata.df.select(_upper(strata.df, "strata_type")).to_series()
+        hits = pl.DataFrame({"parcel_pid": base.df["parcel_pid"].gather(j), "_t": stype.gather(i)})
+        derived = hits.group_by("parcel_pid").agg(
+            pl.len().cast(pl.Float64).alias("_tot"),
+            (c("_t") == "HORIZONTAL").sum().cast(pl.Float64).alias("_hor"),
+            (c("_t") == "VERTICAL").sum().cast(pl.Float64).alias("_ver"),
         )
-        hit = gpd.sjoin(pts, base[["parcel_pid", "geometry"]], how="inner", predicate="within")
-        derived = pd.DataFrame({
-            "total_strata_count": hit.groupby("parcel_pid").size(),
-            "horizontal_strata_count": hit[hit["strata_type"] == "HORIZONTAL"].groupby("parcel_pid").size(),
-            "vertical_strata_count": hit[hit["strata_type"] == "VERTICAL"].groupby("parcel_pid").size(),
-        }).fillna(0)
-        for col in STRATA_COUNT_COLS:
-            fill = base["parcel_pid"].map(derived[col])
-            base[col] = base[col].fillna(fill)
-    return base.reset_index(drop=True), strata.reset_index(drop=True)
+        bdf = base.df.join(derived, on="parcel_pid", how="left", maintain_order="left").with_columns(
+            total_strata_count=c("total_strata_count").fill_null(c("_tot")),
+            horizontal_strata_count=c("horizontal_strata_count").fill_null(c("_hor")),
+            vertical_strata_count=c("vertical_strata_count").fill_null(c("_ver")),
+        ).drop("_tot", "_hor", "_ver")
+        base = base.with_df(bdf)
+    return base, strata
+
+
+def load_cadastre(path: str | Path, layer: str | None = None, bbox=None, use_base_parcels: bool = True,
+                  where: str | None = None) -> tuple[Layer, Layer]:
+    """Read a Geoscape Cadastre table (any supported format) and return ``(base, strata)`` layers."""
+    df, geom, crs = open_table(path, layer or "cadastre").read(where=where, bbox=bbox)
+    if geom is None:
+        raise ValueError(f"cadastre {path} has no geometry column")
+    return prepare_cadastre(Layer(rename_lower(df, CADASTRE_ALIASES), geom, crs), use_base_parcels)

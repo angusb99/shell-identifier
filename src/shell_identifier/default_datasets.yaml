@@ -1,0 +1,151 @@
+# Input datasets for shell-identifier.
+#
+# Each entry says where a dataset is stored, what its table is called and what its
+# columns are called. To point the tool at your data:
+#
+#   1. set `path` for each dataset (or set `root` once and keep relative paths);
+#   2. replace the placeholder table names (labelled_asset, ds_asset, bld, cad) with the
+#      real table names;
+#   3. change any column name on the right-hand side of `columns:` that differs in your data.
+#
+# Column names are matched case-insensitively. A column that isn't found under the name
+# given falls back to the usual G-NAF / Geoscape names (and their shapefile aliases), so
+# most of these only need changing if your tables use their own naming.
+#
+# `path` can be
+#   * a file:     .parquet .csv .psv .tsv .arrow .gpkg .shp .geojson .fgb .sqlite (table ignored
+#                 except for multi-layer GeoPackage / SQLite / FileGDB, where it is the layer name)
+#   * a folder:   the table is <path>/<table>.<ext>, or a folder of parquet parts <path>/<table>/
+#   * a database: GeoPackage / FileGDB (.gdb folder) / SQLite - `table` is the layer inside it
+#   * a glob or object-store URI polars can scan, e.g. s3://bucket/ds_asset/*.parquet
+# Relative paths resolve against `root`, or against the folder holding this file when root is null.
+#
+# `filter` is an optional SQL predicate on the source columns, applied while reading
+# (e.g. "state_abbreviation = 'NSW'"). Geometry columns may be WKB (binary or hex) or WKT.
+# `crs: auto` reads the CRS from GeoPackage / GeoParquet metadata.
+
+root: null
+
+# Address-level labels: which addresses are private dwellings (PD) and which are out of scope.
+# Only the parcel-level count of PD labels is trusted; the model decides which addresses they belong to.
+labelled_asset:
+  path: null
+  table: labelled_asset
+  filter: null
+  columns:
+    address_pid: address_detail_pid
+    label: label
+  # Label values (case-insensitive). Quote them: YAML reads bare YES / NO / TRUE as booleans.
+  pd_values: ["PD", "1", "Y", "YES", "TRUE", "PRIVATE DWELLING"]
+  oos_values: ["OOS", "0", "N", "NO", "FALSE", "OUT OF SCOPE", "NPD"]
+  # Anything else (blank, unknown codes) is treated as unlabelled.
+
+# Every address, G-NAF style: one row per address with its components and a geocode.
+ds_asset:
+  path: null
+  table: ds_asset
+  format: auto          # auto | table | gnaf (a G-NAF PSV release folder) | text (single-line addresses)
+  crs: EPSG:7844        # CRS of the coordinates (GDA2020 lon/lat); use EPSG:4283 for GDA94
+  filter: null
+  states: null          # gnaf format only: e.g. [NSW, ACT]; default every state found
+  localities: null      # text format only: optional file of locality names, one per line
+  columns:
+    address_pid: address_detail_pid
+    longitude: longitude
+    latitude: latitude
+    geometry: null              # or a point geometry column (WKB / WKT) instead of longitude / latitude
+    building_name: building_name
+    lot_number_prefix: lot_number_prefix
+    lot_number: lot_number
+    lot_number_suffix: lot_number_suffix
+    flat_type_code: flat_type_code          # codes (UNIT, APT, SE) or names (APARTMENT, SUITE) both work
+    flat_number_prefix: flat_number_prefix
+    flat_number: flat_number
+    flat_number_suffix: flat_number_suffix
+    level_type_code: level_type_code        # codes (L, G, B) or names (LEVEL, GROUND) both work
+    level_number_prefix: level_number_prefix
+    level_number: level_number
+    level_number_suffix: level_number_suffix
+    number_first_prefix: number_first_prefix
+    number_first: number_first
+    number_first_suffix: number_first_suffix
+    number_last_prefix: number_last_prefix
+    number_last: number_last
+    number_last_suffix: number_last_suffix
+    street_name: street_name
+    street_type_code: street_type_code
+    street_suffix_code: street_suffix_code
+    locality_name: locality_name
+    state: state_abbreviation
+    postcode: postcode
+    alias_principal: alias_principal        # P / A
+    primary_secondary: primary_secondary    # P / S
+    ps_primary_pid: null                    # the primary's ADDRESS_DETAIL_PID on secondary rows, if held
+    legal_parcel_id: legal_parcel_id
+    geocode_type: geocode_type_code         # codes (PC, BC, UC) or names (PROPERTY CENTROID) both work
+    date_retired: date_retired              # rows with a value are dropped
+    address_text: null                      # single-line address, parsed when the component columns are absent
+
+# Geoscape Buildings footprints.
+bld:
+  path: null
+  table: bld
+  crs: auto
+  filter: null
+  height_table: null    # optional Building Height table (building_pid, roof_height)
+  columns:
+    building_pid: building_pid
+    geometry: geometry
+    building_area: building_area
+    total_floor_area: total_floor_area
+    roof_height: roof_height
+    building_use: building_use
+
+# Geoscape Cadastre parcels (base parcels and strata/stratum overlays).
+cad:
+  path: null
+  table: cad
+  crs: auto
+  filter: null
+  use_base_parcels: true
+  columns:
+    parcel_pid: cadastre_pid
+    geometry: geometry
+    parcel_type: parcel_type
+    base_parcel: base_parcel
+    strata_type: strata_type
+    total_strata_count: total_strata_count
+    horizontal_strata_count: horizontal_strata_count
+    vertical_strata_count: vertical_strata_count
+
+# ---- optional --------------------------------------------------------------------
+# Geoscape Buildings link tables. Without them buildings are matched to addresses and
+# parcels spatially. When `bld` is a GeoPackage that also holds these layers they are
+# picked up automatically.
+bld_address:
+  path: null
+  table: building_address
+  filter: null
+  columns:
+    address_pid: address_detail_pid
+    building_pid: building_pid
+    relationship_confidence: relationship_confidence
+    primary_building: primary_building
+
+bld_cadastre:
+  path: null
+  table: building_cadastre
+  filter: null
+  columns:
+    building_pid: building_pid
+    cadastre_pid: cadastre_pid
+    relationship_confidence: relationship_confidence
+
+# Trusted dwelling counts per parcel, overriding the PD-label count where given.
+parcel_counts:
+  path: null
+  table: parcel_counts
+  filter: null
+  columns:
+    parcel_pid: parcel_pid
+    n_dwellings: n_dwellings

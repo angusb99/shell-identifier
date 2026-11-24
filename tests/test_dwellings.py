@@ -3,7 +3,7 @@
 import itertools
 
 import numpy as np
-import pandas as pd
+import polars as pl
 import pytest
 from scipy.special import comb
 
@@ -71,9 +71,9 @@ def test_weak_evidence_keeps_the_label():
 
 def _roles(case, dwellings):
     case.run()
-    s = case.result.reset_index()
-    out = assign_roles(s, s["address_pid"].isin(dwellings).to_numpy()).set_index("address_pid")
-    return out
+    s = case.result
+    out = assign_roles(s, s["address_pid"].is_in(dwellings).to_numpy())
+    return {r["address_pid"]: r for r in out.iter_rows(named=True)}
 
 
 def test_roles_primary_and_sub_shells(case):
@@ -84,12 +84,12 @@ def test_roles_primary_and_sub_shells(case):
     units = [f"U{u}" for u in (101, 102, 201)]
     case.add(*[addr(u, 16, 19, num=1, last=15, building="TOWER A", flat_type="UNIT", flat=int(u[1:])) for u in units])
     r = _roles(case, units)
-    assert r.loc["PRECINCT", "role"] == PRIMARY
-    assert r.loc["TOWER_A", "role"] == SUB
-    assert r.loc["SHOP", "role"] == OOS
-    assert (r.loc[units, "role"] == DWELLING).all()
-    assert r.loc["U101", "primary_shell_pid"] == "PRECINCT"
-    assert r.loc["PRECINCT", "dwellings_below"] == 3
+    assert r["PRECINCT"]["role"] == PRIMARY
+    assert r["TOWER_A"]["role"] == SUB
+    assert r["SHOP"]["role"] == OOS
+    assert all(r[u]["role"] == DWELLING for u in units)
+    assert r["U101"]["primary_shell_pid"] == "PRECINCT"
+    assert r["PRECINCT"]["dwellings_below"] == 3
 
 
 def test_suffix_base_is_shell_but_shop_beside_one_flat_is_not(case):
@@ -99,8 +99,8 @@ def test_suffix_base_is_shell_but_shop_beside_one_flat_is_not(case):
     case.parcel("P2", 30, 0, 42, 45).building("SHOPB", 30.5, 0.5, 41.5, 20, levels=2)
     case.add(addr("SHOP", 36, 6, num=70, geocode="FCS"), addr("FLAT", 36, 6, num=70, sfx="A", geocode="FCS"))
     r = _roles(case, ["A", "B", "FLAT"])
-    assert r.loc["BASE", "role"] == PRIMARY
-    assert r.loc["SHOP", "role"] == OOS
+    assert r["BASE"]["role"] == PRIMARY
+    assert r["SHOP"]["role"] == OOS
 
 
 @pytest.fixture(scope="module")
@@ -112,29 +112,47 @@ def synth(tmp_path_factory):
     return out
 
 
+def _check_verify(res, synth):
+    from shell_identifier.dwellings.evaluate import evaluate_dwellings
+
+    assign = pl.read_csv(res / "dwelling_assignments.csv", infer_schema=False)
+    metrics, _ = evaluate_dwellings(assign, pl.read_csv(synth / "truth" / "shell_truth.csv", infer_schema=False))
+    assert metrics["wrong_labels"] > 0
+    assert metrics["model_accuracy"] > metrics["label_accuracy"]
+    assert metrics["wrong_labels_fixed"] >= 0.6 * metrics["wrong_labels"]
+    assert metrics["correct_labels_broken"] <= 0.02 * metrics["addresses"]
+    # every verified parcel keeps its labelled dwelling count
+    parcels = pl.read_csv(res / "parcel_dwellings.csv")
+    v = parcels.filter(pl.col("mode") == "verified")
+    assert (v["assigned_dwellings"] == v["labelled_pd"]).all()
+    assert (res / "dwelling_model.joblib").exists() and (res / "model_report.md").exists()
+    return metrics
+
+
 def test_verify_fixes_misplaced_labels(synth, tmp_path):
     from shell_identifier.cli import main
-    from shell_identifier.dwellings.evaluate import evaluate_dwellings
 
     inputs = ["--gnaf", str(synth / "G-NAF"), "--cadastre", str(synth / "Cadastre" / "NSW_CADASTRE.gpkg"),
               "--buildings", str(synth / "Buildings" / "NSW_BUILDINGS.gpkg")]
     res = tmp_path / "verify"
     assert main(["dwellings", "verify", *inputs, "--labels", str(synth / "truth" / "pd_labels.csv"),
                  "--folds", "3", "--iterations", "4", "--out", str(res)]) == 0
-    assign = pd.read_csv(res / "dwelling_assignments.csv", dtype={"parcel_pid": str})
-    metrics, _ = evaluate_dwellings(assign, pd.read_csv(synth / "truth" / "shell_truth.csv"))
-    assert metrics["wrong_labels"] > 0
-    assert metrics["model_accuracy"] > metrics["label_accuracy"]
-    assert metrics["wrong_labels_fixed"] >= 0.6 * metrics["wrong_labels"]
-    assert metrics["correct_labels_broken"] <= 0.02 * metrics["addresses"]
-    # every verified parcel keeps its labelled dwelling count
-    parcels = pd.read_csv(res / "parcel_dwellings.csv")
-    v = parcels[parcels["mode"] == "verified"]
-    assert (v["assigned_dwellings"] == v["labelled_pd"]).all()
-    assert (res / "dwelling_model.joblib").exists() and (res / "model_report.md").exists()
+    _check_verify(res, synth)
 
     pred = tmp_path / "predict"
     assert main(["dwellings", "predict", *inputs, "--model", str(res / "dwelling_model.joblib"),
                  "--out", str(pred)]) == 0
-    p = pd.read_csv(pred / "dwelling_assignments.csv")
+    p = pl.read_csv(pred / "dwelling_assignments.csv")
     assert (p["mode"] == "predicted").all()
+
+
+def test_verify_from_the_four_assets(synth, tmp_path):
+    """labelled_asset / ds_asset / bld / cad only (no link tables), located by a datasets YAML."""
+    from shell_identifier.cli import main
+
+    res = tmp_path / "verify_assets"
+    assert main(["dwellings", "verify", "--datasets", str(synth / "assets" / "datasets.yaml"),
+                 "--folds", "3", "--iterations", "4", "--no-gpkg", "--out", str(res)]) == 0
+    m = _check_verify(res, synth)
+    assert m["shell_precision"] > 0.95 and m["shell_recall"] > 0.95
+    assert (res / "dwelling_assignments.parquet").exists()

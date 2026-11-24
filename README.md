@@ -17,7 +17,7 @@ There are two approaches:
 - **Shell scoring** (`shell-identifier run`): an expert-weighted model that needs no labels.
 - **Dwelling model** (`shell-identifier dwellings …`): learns from PD / out-of-scope labels whose per-parcel count is right but whose choice of address may be wrong. It decides which addresses are the dwellings, moves misplaced labels, and names the primary shell. See [Dwelling model from labelled data](#dwelling-model-from-labelled-data).
 
-It uses three data products: **G-NAF**, **Geoscape Cadastre** and **Geoscape Buildings**. It can also read free-text address strings with a rule-based parser. There is no LLM and no libpostal. The scoring is a transparent log-odds model: every probability breaks down into named reasons, such as `12 nested sub-address(es) (12 dwelling) [+5.6]; G-NAF primary with 12 linked secondaries [+2.0]`.
+It uses three data products: **G-NAF**, **Geoscape Cadastre** and **Geoscape Buildings**, plus the PD labels for the dwelling model. Each input is found by a path and a table name in a small YAML file, so it can be a parquet, CSV, GeoPackage, FileGDB or a folder of tables (see [Your datasets](#your-datasets)). All processing up to the model is done in **polars**, with vectorised shapely for the spatial joins. It can also read free-text address strings with a rule-based parser. There is no LLM and no libpostal. The scoring is a transparent log-odds model: every probability breaks down into named reasons, such as `12 nested sub-address(es) (12 dwelling) [+5.6]; G-NAF primary with 12 linked secondaries [+2.0]`.
 
 ## Quick start
 
@@ -27,8 +27,13 @@ python -m venv .venv
 ```
 
 ```bash
-# 1. synthetic G-NAF / Cadastre / Buildings with ground truth
+# 1. synthetic G-NAF / Cadastre / Buildings with ground truth (also writes data/synthetic/assets/)
 shell-identifier synth --out data/synthetic --parcels 1500 --seed 42
+```
+
+```bash
+# 1b. the dwelling model on the four synthetic assets, located by a datasets YAML
+shell-identifier dwellings verify --datasets data/synthetic/assets/datasets.yaml --out results/dwellings
 ```
 
 ```bash
@@ -56,6 +61,65 @@ shell-identifier parse "UNIT 1205, LEVEL 12, TOWER B, THE QUAY, 1-15 SMITH STREE
 ```
 
 Run the tests with `.venv/Scripts/python -m pytest`.
+
+## Your datasets
+
+The pipeline reads four datasets. Their names are placeholders for your real table names:
+
+| dataset | what it holds | key columns (defaults) |
+|---|---|---|
+| `labelled_asset` | PD / out-of-scope label per address | `address_detail_pid`, `label` |
+| `ds_asset` | every address, G-NAF fields, one row each | `address_detail_pid`, `longitude`, `latitude`, the G-NAF number / flat / level / street / locality columns, `alias_principal`, `primary_secondary`, `legal_parcel_id`, `geocode_type_code`, `date_retired` |
+| `bld` | Geoscape Buildings footprints | `building_pid`, geometry, `building_area`, `total_floor_area`, `roof_height`, `building_use` |
+| `cad` | Geoscape Cadastre parcels (base + strata) | `cadastre_pid`, geometry, `parcel_type`, `base_parcel`, `strata_type`, strata counts |
+
+Optional extras: `bld_address` and `bld_cadastre` (the Geoscape link tables) and `parcel_counts` (trusted dwelling counts).
+
+**1. Write the datasets file** and edit the paths, table names and any column names that differ:
+
+```bash
+shell-identifier datasets template --out datasets.yaml
+```
+
+A minimal file needs only the paths and the real table names:
+
+```yaml
+root: D:/data/address_project        # relative paths and unset paths resolve here
+labelled_asset: {table: census_pd_labels}
+ds_asset:       {table: gnaf_address_view}
+bld:            {table: geoscape_buildings}
+cad:            {table: geoscape_cadastre}
+```
+
+Each `path` can be a file (`.parquet`, `.csv`, `.psv`, `.arrow`, `.gpkg`, `.shp`, `.fgb`, …), a folder (the table is `<folder>/<table>.<ext>` or a folder of parquet parts `<folder>/<table>/`), a GeoPackage, FileGDB or SQLite database (the table is the layer), or a glob or object-store URI that polars can scan. Column mappings are `canonical: your_column`, matched case-insensitively. If a name isn't found, the usual G-NAF and Geoscape names and the 10-character shapefile aliases are tried. `filter:` takes an SQL predicate on the source columns, for example `"state_abbreviation = 'NSW'"`. Geometry can be WKB (binary or hex), WKT or GeoParquet. Flat, level and geocode types can be codes (`APT`, `L`, `PC`) or names (`APARTMENT`, `LEVEL`, `PROPERTY CENTROID`). For `labelled_asset`, set `pd_values` / `oos_values` to your label codes. Any other value is treated as unlabelled, and the run log lists which values it saw.
+
+**2. Check it against the data.** This shows where each dataset resolved to, its row count and CRS, and which column each field maps to:
+
+```bash
+shell-identifier datasets check --datasets datasets.yaml
+```
+
+**3. Run.** Paths and table names on the command line override the file:
+
+```bash
+shell-identifier dwellings verify --datasets datasets.yaml --out results/dwellings
+```
+
+```bash
+shell-identifier dwellings verify --labelled-asset D:/data --ds-asset D:/data --bld D:/data --cad D:/data --table ds_asset=gnaf_address_view --table cad=geoscape_cadastre --out results/dwellings
+```
+
+The same flags work for `run`, `dwellings predict` and `datasets check`. `ds_asset` can also be a G-NAF PSV release folder (detected automatically, or use `--gnaf`) or single-line address text (`format: text` or `--text`; parsed by the rule-based parser). In Python:
+
+```python
+from shell_identifier import datasets_config, load_inputs, prepare_context
+from shell_identifier.dwellings import verify, write_outputs
+
+ds = datasets_config("datasets.yaml", {"ds_asset": {"path": "D:/data/addresses.parquet"}})
+inputs = load_inputs(ds, labels=True)
+ctx = prepare_context(*inputs.pipeline_args())
+write_outputs(verify(ctx, inputs.labels, counts=inputs.counts), "results/dwellings")
+```
 
 ## How it works
 
@@ -85,7 +149,7 @@ The **free-text parser** handles commas or none, slash units (`5/25`, `G01/25-27
 
 ### 2. Context features (`features.py`)
 
-Each address is described against the other **principal** addresses on its parcel. Aliases are scored but never count as context. Everything is groupby/merge based, so there are no per-parcel Python loops.
+Each address is described against the other **principal** addresses on its parcel. Aliases are scored but never count as context. Everything is polars group-by / join work, so there are no per-parcel Python loops.
 
 | feature | default weight | meaning |
 |---|---:|---|
@@ -142,7 +206,7 @@ Training minimises `NLL + l2·‖w − w_default‖²`. Weights only move where 
 
 | file | content |
 |---|---|
-| `address_scores.csv` / `.gpkg` | `address_pid, address_label, parcel_pid, building_pid, shell_probability, shell_class, parent_pid, parent_label, node_type, n_desc, n_range_desc, n_offparcel_desc, n_suffix_variants, reasons, …` |
+| `address_scores.csv` / `.gpkg` (`--no-gpkg` to skip) | `address_pid, address_label, parcel_pid, building_pid, shell_probability, shell_class, parent_pid, parent_label, node_type, n_desc, n_range_desc, n_offparcel_desc, n_suffix_variants, reasons, …` |
 | `address_features.csv` | every `f_*` model feature plus the logit, for training and auditing |
 | `parcel_summary.csv` | per parcel: counts per class, top candidate, shell PIDs, building/strata context, and a `pattern` (`SINGLE_ADDRESS`, `MULTI_UNIT_WITH_SHELL`, `MULTI_UNIT_NO_SHELL`, `SUFFIX_GROUP_WITH_SHELL`, `SUFFIX_GROUP_ALL_OCCUPIABLE`, `RANGE_PRECINCT`, `MULTI_FRONTAGE`, `NEEDS_REVIEW`) |
 
@@ -150,13 +214,13 @@ Training minimises `NLL + l2·‖w − w_default‖²`. Weights only move where 
 
 ## Input schemas
 
-The synthetic data follows these schemas and the loaders read them. **Check them against your copies**: names follow the public product guides, and loaders also accept the 10-character Shapefile aliases.
+These are the product layouts the loaders know by default. Any other naming is mapped in the datasets YAML (see [Your datasets](#your-datasets)). **Check them against your copies**: names follow the public product guides, and loaders also accept the 10-character Shapefile aliases.
 
-**G-NAF** (PSV release, found by recursive glob under `--gnaf`): `{STATE}_ADDRESS_DETAIL`, `_ADDRESS_DEFAULT_GEOCODE`, `_STREET_LOCALITY`, `_LOCALITY`, `_STATE`, `_PRIMARY_SECONDARY` (optional). Retired rows are dropped. GDA2020 (`--crs EPSG:7844`) by default; pass `--crs EPSG:4283` for GDA94.
+**G-NAF** as a flattened address table (`ds_asset`; one row per address, ADDRESS_VIEW-style names), or as the PSV release (found by recursive glob): `{STATE}_ADDRESS_DETAIL`, `_ADDRESS_DEFAULT_GEOCODE`, `_STREET_LOCALITY`, `_LOCALITY`, `_STATE`, `_PRIMARY_SECONDARY` (optional). Retired rows are dropped. GDA2020 (`--crs EPSG:7844`) by default; pass `--crs EPSG:4283` for GDA94.
 
 **Geoscape Cadastre** (layer `cadastre`): `cadastre_pid`, `parcel_type` (Lot/Strata/Stratum/Road), `base_parcel` (Yes/NULL), `strata_type`, `total_strata_count`, `horizontal_strata_count`, `vertical_strata_count`, … Only base parcels (`base_parcel = "Yes"`, or else `parcel_type = "Lot"`) define the parcel context. Where strata counts are empty, they are derived from the strata polygons.
 
-**Geoscape Buildings**: `buildings` (`building_pid`, `building_area`, `total_floor_area`, …), plus the aspatial `building_address` (`building_pid`, `address_detail_pid`, `relationship_confidence`, `primary_building`) and `building_cadastre` tables. These are read automatically from the same GeoPackage, or given with `--building-address` / `--building-cadastre`. `--building-height` joins the Building Height insight pack (`roof_height`) when floor area is missing.
+**Geoscape Buildings**: `buildings` (`building_pid`, `building_area`, `total_floor_area`, …), plus the optional aspatial `building_address` (`building_pid`, `address_detail_pid`, `relationship_confidence`, `primary_building`) and `building_cadastre` tables. When `bld` is a GeoPackage holding those layers they are read automatically; otherwise give them as `bld_address` / `bld_cadastre` (or `--bld-address` / `--bld-cadastre`). Without them, addresses and buildings are matched to parcels spatially, which works as well on the synthetic data. `height_table` / `--building-height` joins the Building Height insight pack (`roof_height`) when floor area is missing, and a missing `building_area` is measured from the footprint.
 
 ## Synthetic data
 
@@ -176,13 +240,19 @@ The data also includes realistic noise:
 
 It also writes the same addresses as messy free text: abbreviations, slash units, title case and missing commas.
 
+`assets/` holds the four pipeline inputs as standalone tables in the shape of a typical export:
+- `ds_asset.parquet` is a flattened address view, with upper-case names, flat / level / geocode type *names*, `PRIMARY_PID` and retired rows.
+- `bld.parquet` and `cad.parquet` are GeoParquet.
+- `labelled_asset.parquet` holds the noisy PD labels.
+- `datasets.yaml` points at the four tables.
+
 ### Results on synthetic data
 
 | | addresses | ROC AUC | contested F1 @0.5 | errors @0.5 | UNCERTAIN |
 |---|---:|---:|---:|---:|---:|
 | seed 42, 1,500 parcels (G-NAF input) | 8,179 | 1.000 | 0.994 | 8 FP / 0 FN | 6 |
 | same, free-text input | 8,179 | 1.000 | 0.996 | 5 FP / 0 FN | 5 |
-| seed 11, 15,000 parcels (23 s) | 89,823 | 1.000 | 0.997 | 34 FP / 6 FN | — |
+| seed 11, 15,000 parcels (5 s; 23 s before the polars port) | 89,823 | 1.000 | 0.997 | 34 FP / 6 FN | — |
 
 The parser recovered 100% of street, number, building and level components from the free text. Every flat number was recovered too; the only differences are flat types missing in slash forms like `5/25`. All remaining errors are houses with a secondary dwelling where one of the two buildings was not captured.
 
@@ -207,15 +277,15 @@ Buildings turn about 60 UNCERTAIN suffix and duplex cases into confident answers
 Use this when you have address labels of **PD** (private dwelling) or **out of scope**, where each parcel's number of PDs is right but a label is sometimes on the wrong address. Typical mistakes are `20 X ST` instead of `UNIT 5, 20 X ST`, or `10` instead of `10B`.
 
 ```bash
-shell-identifier dwellings verify --gnaf <G-NAF dir> --cadastre <cadastre.gpkg> --buildings <buildings.gpkg> --labels labels.csv --out results/dwellings
+shell-identifier dwellings verify --datasets datasets.yaml --out results/dwellings
 ```
 
 ```bash
-# apply the trained model to unlabelled areas (optionally with known counts: --counts parcel_pid,n_dwellings)
-shell-identifier dwellings predict --model results/dwellings/dwelling_model.joblib --gnaf <G-NAF dir> --cadastre <cadastre.gpkg> --buildings <buildings.gpkg> --out results/predicted
+# apply the trained model to unlabelled areas (optionally with known counts: parcel_counts / --counts)
+shell-identifier dwellings predict --model results/dwellings/dwelling_model.joblib --datasets datasets.yaml --out results/predicted
 ```
 
-`labels.csv` needs an address id and a label. The defaults are `address_detail_pid` and `label`; change them with `--labels-id` / `--label-col`. Values `PD/1/Y/YES/TRUE` mean dwelling, and `OOS/0/N/NO/FALSE` mean out of scope; override them with `--pd-values` / `--oos-values`. Addresses missing from the file are treated as unlabelled candidates. A parcel's dwelling count is its number of PD labels, unless you pass trusted counts with `--counts`.
+`labelled_asset` needs an address id and a label. The defaults are `address_detail_pid` and `label`; change them in the datasets YAML, or with `--labels-id` / `--label-col`. Values `PD/1/Y/YES/TRUE` mean dwelling, and `OOS/0/N/NO/FALSE` mean out of scope; override them with `pd_values` / `oos_values` (or `--pd-values` / `--oos-values`). Boolean and 0/1 label columns work as they are. Addresses missing from the labels are treated as unlabelled candidates. A parcel's dwelling count is its number of PD labels, unless you give trusted counts as `parcel_counts` (`--counts`).
 
 ### How it works
 
@@ -247,7 +317,7 @@ A non-dwelling above a single dwelling only counts as a shell if it also looks l
 
 | file | content |
 |---|---|
-| `dwelling_assignments.csv` / `.gpkg` | per address: input label, cross-fitted `dwelling_prob`, `posterior`, rank in parcel, `role`, `label_change` (`PD->OOS`, `OOS->PD`), primary shell, `evidence` (what the model saw) and `decision` |
+| `dwelling_assignments.csv` / `.parquet` / `.gpkg` | per address: input label, cross-fitted `dwelling_prob`, `posterior`, rank in parcel, `role`, `label_change` (`PD->OOS`, `OOS->PD`), primary shell, `evidence` (what the model saw) and `decision` |
 | `label_moves.csv` | each moved label: `from` address → `to` address with posteriors and a confidence; this is the review list |
 | `parcel_dwellings.csv` | per parcel: labelled vs assigned dwellings, expected dwellings, primary shell(s), `status` (`AGREES_WITH_LABELS` / `LABELS_MOVED` / `PREDICTED`), and `margin` (gap between the weakest dwelling and the strongest non-dwelling); `review` is set when the margin is < 0.3 |
 | `dwelling_model.joblib`, `model_report.md` | the fitted model for `predict`, EM history, estimated misplacement rate, feature importances |
@@ -258,7 +328,8 @@ The generator writes `truth/pd_labels.csv`: the PD count is right on every site,
 
 | | result |
 |---|---|
-| `verify`, seed 42 (8,179 addresses, 360 misplaced labels) | address accuracy 0.956 → **1.000**; **360 / 360** misplaced labels moved to the right address, **0** correct labels broken; shells precision / recall **1.000 / 1.000**; misplacement rate estimated 0.30 (true 0.30); 6 EM iterations, ~90 s |
+| `verify`, seed 42 (8,179 addresses, 360 misplaced labels) | address accuracy 0.956 → **1.000**; **360 / 360** misplaced labels moved to the right address, **0** correct labels broken; shells precision / recall **1.000 / 1.000**; misplacement rate estimated 0.30 (true 0.30); 5–6 EM iterations, ~80 s |
+| same, from the four `assets/` tables only (no Geoscape link tables) | identical: **360 / 360** fixed, 0 broken, shells 1.000 / 1.000 |
 | `predict` on a different suburb (seed 11), no labels, no counts | address accuracy **0.997**; 99.1% of parcels exactly right |
 | same, with known parcel counts (`--counts`) | address accuracy **1.000** |
 
@@ -273,4 +344,4 @@ Runtime is dominated by the classifier fits (folds × iterations). For large ext
 - **The legal parcel regexes are NSW-flavoured** (`CP/SP…`, `n/SP…`). Adjust `legal_*_patterns` for other jurisdictions.
 - **Strata counts may include car-space and storage lots**, which is why those checks only apply to small groups.
 - **The parser is rule-based.** It covers common Australian formats, but unusual strings (corner descriptions, `RMB`, `CNR X & Y`) will produce warnings in `parse_warnings`. Pass a locality list (`--localities`) for best street/locality splitting.
-- **Scale.** Throughput is about 4k addresses/s on one core. Run state by state, or use `--bbox` windows with some overlap, for very large extracts.
+- **Scale.** Loading and features are polars: the shell scorer handles the 8k-address synthetic suburb in under 0.5 s, and the polars port reproduces the earlier pandas results exactly. The dwelling model's time is in the classifier fits (folds × iterations). For a state-sized extract, run state by state, use `--bbox` windows with some overlap, or a `filter:` in the datasets YAML.

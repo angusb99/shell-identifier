@@ -19,102 +19,117 @@ nested inside it (towers, levels) are SUB_SHELLs.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
+
+from ..frames import c, left_join
 
 DWELLING, PRIMARY, SUB, OOS = "DWELLING", "PRIMARY_SHELL", "SUB_SHELL", "OUT_OF_SCOPE"
 MAX_DEPTH = 6
 
 
-def extended_parents(s: pd.DataFrame) -> pd.Series:
+def extended_parents(s: pl.DataFrame) -> pl.Series:
     """parent_pid, filled with suffix-base and cross-parcel street-address parents."""
-    parent = s["parent_pid"].fillna("").astype(str).copy()
-    principal = ~s["is_alias"]
-    bare_base = s[principal & (s["mask"] == 0) & (s["num_suffix"] == "") & s["num_last"].isna() & (s["num_key"] != "")]
     keys = ["parcel_pid", "street_key", "base_num_key"]
-    base_pid = bare_base.drop_duplicates(keys).set_index(keys)["address_pid"]
-    need = (parent == "") & (s["num_suffix"] != "") & s["num_last"].isna()
-    if need.any():
-        idx = pd.MultiIndex.from_frame(s.loc[need, keys])
-        parent.loc[need] = base_pid.reindex(idx).fillna("").to_numpy()
+    t = s.select("address_pid", "parent_pid", "is_alias", "mask", "num_suffix", "num_last", "num_key",
+                 "parcel_pid", "street_key", "base_num_key").with_columns(
+        parent=c("parent_pid").cast(pl.Utf8).fill_null(""))
+    principal = ~c("is_alias")
+    bare_base = (t.filter(principal & (c("mask") == 0) & (c("num_suffix") == "") & c("num_last").is_null()
+                          & (c("num_key") != ""))
+                 .unique(keys, keep="first", maintain_order=True).select(*keys, c("address_pid").alias("_base")))
+    t = left_join(t, bare_base, keys)
+    need = (c("parent") == "") & (c("num_suffix") != "") & c("num_last").is_null()
+    t = t.with_columns(parent=pl.when(need).then(c("_base").fill_null("")).otherwise(c("parent")))
 
     # Sub-addresses on a different parcel from their street address (geocode slip).
-    bare = s[principal & (s["mask"] == 0) & (s["num_key"] != "")]
-    by_street = bare.drop_duplicates(["street_key", "num_key"], keep=False).set_index(["street_key", "num_key"])
-    need = (parent == "") & (s["mask"] != 0) & (s["num_key"] != "")
-    if need.any():
-        idx = pd.MultiIndex.from_frame(s.loc[need, ["street_key", "num_key"]])
-        cand = by_street["address_pid"].reindex(idx).fillna("").to_numpy()
-        cand_parcel = by_street["parcel_pid"].reindex(idx).fillna("").to_numpy()
-        ok = cand_parcel != s.loc[need, "parcel_pid"].to_numpy()
-        parent.loc[need] = np.where(ok, cand, "")
-    return parent
+    bare = t.filter(principal & (c("mask") == 0) & (c("num_key") != ""))
+    by_street = (bare.filter(pl.len().over(["street_key", "num_key"]) == 1)
+                 .select("street_key", "num_key", c("address_pid").alias("_cand"), c("parcel_pid").alias("_cand_parcel")))
+    t = left_join(t, by_street, ["street_key", "num_key"])
+    need = (c("parent") == "") & (c("mask") != 0) & (c("num_key") != "")
+    ok = c("_cand_parcel").fill_null("") != c("parcel_pid")
+    t = t.with_columns(parent=pl.when(need).then(pl.when(ok).then(c("_cand").fill_null("")).otherwise(pl.lit("")))
+                       .otherwise(c("parent")))
+    return t.get_column("parent")
 
 
-def assign_roles(s: pd.DataFrame, dwelling: np.ndarray, shell_threshold: float = 0.5) -> pd.DataFrame:
+class _Chain:
+    """Vectorised walks up a pid -> parent table."""
+
+    def __init__(self, pid: pl.Series, parent: pl.Series):
+        self.pid, self.parent = pid, parent
+        self.pos = pl.Series(np.arange(len(pid), dtype=np.int64))
+
+    def up(self, cur: pl.Series) -> pl.Series:
+        return cur.replace_strict(self.pid, self.parent, default="", return_dtype=pl.Utf8)
+
+    def index(self, cur: pl.Series) -> np.ndarray:
+        return cur.replace_strict(self.pid, self.pos, default=-1, return_dtype=pl.Int64).to_numpy()
+
+
+def assign_roles(s: pl.DataFrame, dwelling: np.ndarray, shell_threshold: float = 0.5) -> pl.DataFrame:
     """Role, number of dwellings beneath, and the primary shell of each address's chain."""
-    s = s.reset_index(drop=True)
-    pid = s["address_pid"].astype(str)
+    n = s.height
+    pid = s.get_column("address_pid").cast(pl.Utf8)
     parent = extended_parents(s)
-    parent_of = pd.Series(parent.to_numpy(), index=pid.to_numpy())
-    is_dw = pd.Series(np.asarray(dwelling, dtype=bool), index=pid.to_numpy())
+    chain = _Chain(pid, parent)
+    is_dw = np.asarray(dwelling, dtype=bool)
 
     # Walk up from every dwelling, counting the dwellings beneath each ancestor.
-    below = pd.Series(0, index=pid.to_numpy(), dtype=int)
-    cur = parent_of[is_dw.to_numpy()]
+    below = np.zeros(n, dtype=np.int64)
+    cur = parent.filter(pl.Series(is_dw))
     for _ in range(MAX_DEPTH):
-        cur = cur[cur != ""]
-        if cur.empty:
+        cur = cur.filter(cur != "")
+        if cur.is_empty():
             break
-        below = below.add(cur.value_counts().reindex(below.index, fill_value=0))
-        cur = pd.Series(parent_of.reindex(cur.to_numpy()).fillna("").to_numpy())
+        ix = chain.index(cur)
+        below += np.bincount(ix[ix >= 0], minlength=n)
+        cur = chain.up(cur)
 
     # A non-dwelling above dwellings is a shell when it looks like one: two or more dwellings
     # beneath it, or a shell-like address on the expert score. A shop with one flat beside or
     # above it (70 / 70A) is an occupancy in its own right, so it stays out of scope.
-    shell_like = pd.Series(s["shell_probability"].fillna(0).to_numpy() >= shell_threshold, index=pid.to_numpy())
+    shell_like = s.get_column("shell_probability").fill_null(0).to_numpy() >= shell_threshold
     container = (below > 0) & ~is_dw & ((below >= 2) | shell_like)
-    # A container is primary when no ancestor of it is also a (non-dwelling) container.
-    has_container_above = pd.Series(False, index=pid.to_numpy())
-    cur = parent_of.copy()
+
+    # Walk up from every address: is any ancestor a container, and which primary shell is on top?
+    has_container_above = np.zeros(n, dtype=bool)
+    ancestors = []
+    cur = parent
     for _ in range(MAX_DEPTH):
-        hit = cur.map(container).fillna(False).astype(bool) & (cur != "")
-        has_container_above |= hit
-        cur = cur.map(parent_of).fillna("")
-        if (cur == "").all():
+        ix = chain.index(cur)
+        if (ix < 0).all():
             break
+        ancestors.append(ix)
+        has_container_above |= (ix >= 0) & container[np.clip(ix, 0, None)]
+        cur = chain.up(cur)
 
-    role = np.where(is_dw, DWELLING, np.where(container & ~has_container_above, PRIMARY,
-                                              np.where(container, SUB, OOS)))
-    out = pd.DataFrame({"address_pid": pid, "role": role, "dwellings_below": below.to_numpy(),
-                        "extended_parent_pid": parent.to_numpy()})
-    # Primary shell of each address: the first PRIMARY_SHELL met walking up its chain.
-    is_primary = pd.Series(role == PRIMARY, index=pid.to_numpy())
-    top = pd.Series(np.where(is_primary, pid, ""), index=pid.to_numpy(), dtype=object)
-    cur = parent_of.copy()
-    for _ in range(MAX_DEPTH):
-        hit = cur.map(is_primary).fillna(False).astype(bool) & (cur != "")
-        top = top.where((top != "") | ~hit, cur)
-        cur = cur.map(parent_of).fillna("")
-    out["primary_shell_pid"] = top.to_numpy()
-    return out
+    is_primary = container & ~has_container_above
+    role = np.where(is_dw, DWELLING, np.where(is_primary, PRIMARY, np.where(container, SUB, OOS)))
+    top = np.where(is_primary, pid.to_numpy(), "").astype(object)
+    pid_np = pid.to_numpy()
+    for ix in ancestors:
+        hit = (ix >= 0) & is_primary[np.clip(ix, 0, None)] & (top == "")
+        top[hit] = pid_np[ix[hit]]
+    return pl.DataFrame({"address_pid": pid, "role": role, "dwellings_below": below,
+                         "extended_parent_pid": parent, "primary_shell_pid": pl.Series(top, dtype=pl.Utf8)})
 
 
-def pair_moves(df: pd.DataFrame) -> pd.DataFrame:
+def pair_moves(df: pl.DataFrame) -> pl.DataFrame:
     """Pair, within each parcel, PD labels the model removed with addresses it promoted.
 
     Expects ``parcel_pid, address_pid, address_label, y, assigned, posterior``.
     Returns one row per move: from (labelled PD, not assigned) -> to (assigned, not labelled PD).
     """
-    removed = df[(df["y"] == 1) & ~df["assigned"]].sort_values("posterior")
-    added = df[(df["y"] != 1) & df["assigned"]].sort_values("posterior", ascending=False)
-    removed = removed.assign(_n=removed.groupby("parcel_pid").cumcount())
-    added = added.assign(_n=added.groupby("parcel_pid").cumcount())
-    m = removed.merge(added, on=["parcel_pid", "_n"], how="outer", suffixes=("_from", "_to"))
-    return pd.DataFrame({
-        "parcel_pid": m["parcel_pid"],
-        "from_pid": m["address_pid_from"], "from_label": m["address_label_from"],
-        "from_posterior": m["posterior_from"].round(3),
-        "to_pid": m["address_pid_to"], "to_label": m["address_label_to"],
-        "to_posterior": m["posterior_to"].round(3),
-        "confidence": (m["posterior_to"].fillna(1) - m["posterior_from"].fillna(0)).round(3),
-    }).sort_values("confidence", ascending=False)
+    cols = ["parcel_pid", "address_pid", "address_label", "posterior"]
+    removed = (df.filter((c("y") == 1) & ~c("assigned")).sort("posterior", maintain_order=True)
+               .with_columns(_n=pl.int_range(pl.len()).over("parcel_pid")).select(cols + ["_n"]))
+    added = (df.filter((c("y") != 1) & c("assigned")).sort("posterior", descending=True, maintain_order=True)
+             .with_columns(_n=pl.int_range(pl.len()).over("parcel_pid")).select(cols + ["_n"]))
+    m = removed.join(added, on=["parcel_pid", "_n"], how="full", suffix="_to", coalesce=True)
+    return m.select(
+        "parcel_pid",
+        from_pid=c("address_pid"), from_label=c("address_label"), from_posterior=c("posterior").round(3),
+        to_pid=c("address_pid_to"), to_label=c("address_label_to"), to_posterior=c("posterior_to").round(3),
+        confidence=(c("posterior_to").fill_null(1) - c("posterior").fill_null(0)).round(3),
+    ).sort("confidence", descending=True, maintain_order=True)

@@ -275,3 +275,18 @@ def normalise_street_type(value: str) -> str:
 def normalise_street_suffix(value: str) -> str:
     v = (value or "").strip().upper()
     return STREET_SUFFIX_ABBREV_ALIASES.get(v) or STREET_SUFFIX_WORD_ALIASES.get(v) or v
+
+
+_GEOCODE_BY_NAME = {name: code for code, (name, _) in GEOCODE_TYPES.items()}
+
+
+def normalise_geocode_type(value: str) -> str:
+    """Geocode type code from a code or its description ("PROPERTY CENTROID" -> "PC")."""
+    v = " ".join((value or "").strip().upper().split())
+    return v if v in GEOCODE_TYPES else _GEOCODE_BY_NAME.get(v, v)
+
+
+def geocode_category(code: str) -> str:
+    """parcel / building / unit / other ('' when unknown)."""
+    return GEOCODE_TYPES.get(normalise_geocode_type(code), ("", ""))[1]
+

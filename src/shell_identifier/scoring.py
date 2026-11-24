@@ -10,104 +10,110 @@ which become the ``reasons`` text.
 from __future__ import annotations
 
 import numpy as np
-import pandas as pd
+import polars as pl
+
+from .frames import c, int_text, join_nonempty
+
+REASON_CATS = ("dwelling", "commercial", "level", "structure", "secondary", "ancillary")
 
 
 def feature_names(cfg: dict) -> list[str]:
     return list(cfg["scoring"]["weights"])
 
 
-def _s(x) -> pd.Series:
-    return x.round(0).astype("Int64").astype(str)
+def _breakdown() -> pl.Expr:
+    return join_nonempty([pl.when(c(f"n_desc_{k}") > 0).then(int_text(c(f"n_desc_{k}")) + f" {k}")
+                          .otherwise(pl.lit("")) for k in REASON_CATS], ", ")
 
 
-def _breakdown(df: pd.DataFrame) -> pd.Series:
-    parts = []
-    for cat in ("dwelling", "commercial", "level", "structure", "secondary", "ancillary"):
-        n = df[f"n_desc_{cat}"].fillna(0).astype(int)
-        parts.append(np.where(n > 0, n.astype(str) + " " + cat, ""))
-    joined = pd.Series([", ".join(p for p in row if p) for row in zip(*parts)], index=df.index)
-    return joined
-
-
-def reason_texts(df: pd.DataFrame) -> dict[str, pd.Series]:
-    """Human-readable text for each feature, evaluated row-wise (used only where the feature fires)."""
-    pct = (100 * df["f_stacked_children"]).round(0).astype(int).astype(str)
+def reason_texts() -> dict[str, pl.Expr]:
+    """Human-readable text for each feature (evaluated only on rows where the feature contributes)."""
+    lit = pl.lit
     return {
-        "log_children": _s(df["n_desc"]) + " nested sub-address(es) (" + _breakdown(df) + ")",
-        "single_child": pd.Series("only one nested sub-address", index=df.index),
-        "only_secondary_children": pd.Series("nested sub-addresses are secondary dwellings only (REAR/COTTAGE)", index=df.index),
-        "only_ancillary_children": pd.Series("nested sub-addresses are ancillary only (car space/storage)", index=df.index),
-        "log_range_children": "number range covers " + _s(df["n_range_numbers"]) + " other number(s), "
-                              + _s(df["n_range_desc"]) + " address(es)",
-        "log_offparcel_children": _s(df["n_offparcel_desc"]) + " sub-address(es) of this street address on nearby parcels",
-        "stacked_children": pct + "% of nested sub-addresses share its geocode",
-        "suffix_base": "unsuffixed number with suffixed siblings (" + df["suffix_list"].astype(str) + ")",
-        "suffix_multi_variant": pd.Series("two or more suffix variants: base number usually split", index=df.index),
-        "suffix_single_variant": pd.Series("single suffix variant: base and suffix often both occupied", index=df.index),
-        "strata_matches_siblings": "strata count " + _s(df["total_strata_count"]) + " = "
-                                   + _s(df["n_other_dwellings"]) + " other dwelling(s)",
-        "strata_exceeds_siblings": "strata count " + _s(df["total_strata_count"]) + " > "
-                                   + _s(df["n_other_dwellings"]) + " other dwelling(s)",
-        "building_surplus": _s(df["n_dwelling_buildings"]) + " building(s) for " + _s(df["n_other_dwellings"])
-                            + " other dwelling(s)",
-        "building_deficit": "only " + _s(df["n_dwelling_buildings"]) + " building(s) for "
-                            + _s(df["n_other_dwellings"]) + " other dwelling(s)",
-        "own_building": pd.Series("geocode in a building no other address uses", index=df.index),
-        "outside_buildings": pd.Series("geocode outside every building while siblings are inside one", index=df.index),
-        "multistorey": "parcel has a ~" + _s(df["max_levels"]) + "-storey building",
-        "vertical_strata": "vertical strata scheme (" + _s(df["vertical_strata_count"]) + " lots)",
-        "parcel_level_geocode": "parcel-level geocode (" + df["geocode_type"].astype(str)
+        "log_children": int_text(c("n_desc")) + " nested sub-address(es) (" + _breakdown() + ")",
+        "single_child": lit("only one nested sub-address"),
+        "only_secondary_children": lit("nested sub-addresses are secondary dwellings only (REAR/COTTAGE)"),
+        "only_ancillary_children": lit("nested sub-addresses are ancillary only (car space/storage)"),
+        "log_range_children": "number range covers " + int_text(c("n_range_numbers")) + " other number(s), "
+                              + int_text(c("n_range_desc")) + " address(es)",
+        "log_offparcel_children": int_text(c("n_offparcel_desc")) + " sub-address(es) of this street address on nearby parcels",
+        "stacked_children": int_text(100 * c("f_stacked_children")) + "% of nested sub-addresses share its geocode",
+        "suffix_base": "unsuffixed number with suffixed siblings (" + c("suffix_list") + ")",
+        "suffix_multi_variant": lit("two or more suffix variants: base number usually split"),
+        "suffix_single_variant": lit("single suffix variant: base and suffix often both occupied"),
+        "strata_matches_siblings": "strata count " + int_text(c("total_strata_count")) + " = "
+                                   + int_text(c("n_other_dwellings")) + " other dwelling(s)",
+        "strata_exceeds_siblings": "strata count " + int_text(c("total_strata_count")) + " > "
+                                   + int_text(c("n_other_dwellings")) + " other dwelling(s)",
+        "building_surplus": int_text(c("n_dwelling_buildings")) + " building(s) for "
+                            + int_text(c("n_other_dwellings")) + " other dwelling(s)",
+        "building_deficit": "only " + int_text(c("n_dwelling_buildings")) + " building(s) for "
+                            + int_text(c("n_other_dwellings")) + " other dwelling(s)",
+        "own_building": lit("geocode in a building no other address uses"),
+        "outside_buildings": lit("geocode outside every building while siblings are inside one"),
+        "multistorey": "parcel has a ~" + int_text(c("max_levels")) + "-storey building",
+        "vertical_strata": "vertical strata scheme (" + int_text(c("vertical_strata_count")) + " lots)",
+        "parcel_level_geocode": "parcel-level geocode (" + c("geocode_type").cast(pl.Utf8)
                                 + ") while siblings have building/unit geocodes",
-        "gnaf_primary_linked": "G-NAF primary with " + _s(df["n_ps_secondaries"]) + " linked secondaries",
-        "gnaf_primary_flag_only": pd.Series("G-NAF primary flag, no linked secondaries", index=df.index),
-        "gnaf_secondary": pd.Series("G-NAF secondary address", index=df.index),
-        "legal_common_property": "legal parcel is common property (" + df["legal_parcel_id"].astype(str) + ")",
-        "legal_strata_lot": "legal parcel is a strata lot (" + df["legal_parcel_id"].astype(str) + ")",
-        "vanity_name": pd.Series("carries a building/complex name", index=df.index),
-        "leaf_subaddress": pd.Series("sub-address with nothing nested under it", index=df.index),
-        "leaf_street_address": pd.Series("street address with no nested, ranged or suffixed addresses", index=df.index),
-        "single_address_parcel": pd.Series("only address on the parcel", index=df.index),
-        "has_parent": "nested under " + df.get("parent_label", df["parent_pid"]).astype(str),
-        "alias": pd.Series("G-NAF alias address", index=df.index),
+        "gnaf_primary_linked": "G-NAF primary with " + int_text(c("n_ps_secondaries").cast(pl.Float64, strict=False))
+                               + " linked secondaries",
+        "gnaf_primary_flag_only": lit("G-NAF primary flag, no linked secondaries"),
+        "gnaf_secondary": lit("G-NAF secondary address"),
+        "legal_common_property": "legal parcel is common property (" + c("legal_parcel_id").cast(pl.Utf8) + ")",
+        "legal_strata_lot": "legal parcel is a strata lot (" + c("legal_parcel_id").cast(pl.Utf8) + ")",
+        "vanity_name": lit("carries a building/complex name"),
+        "leaf_subaddress": lit("sub-address with nothing nested under it"),
+        "leaf_street_address": lit("street address with no nested, ranged or suffixed addresses"),
+        "single_address_parcel": lit("only address on the parcel"),
+        "has_parent": "nested under " + c("parent_label"),
+        "alias": lit("G-NAF alias address"),
     }
 
 
-def classify(p: pd.Series, bands: list) -> pd.Series:
+def classify(p: pl.Expr, bands: list) -> pl.Expr:
     bands = sorted(((float(lo), str(name)) for lo, name in bands), reverse=True)
-    out = pd.Series(bands[-1][1], index=p.index, dtype=object)
-    for lo, name in reversed(bands):
-        out[p >= lo] = name
-    return out
+    expr = pl.when(p >= bands[0][0]).then(pl.lit(bands[0][1]))
+    for lo, name in bands[1:-1]:
+        expr = expr.when(p >= lo).then(pl.lit(name))
+    return expr.otherwise(pl.lit(bands[-1][1]))
 
 
-def score(feats: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+def _reasons(out: pl.DataFrame, names: list[str], contrib: np.ndarray, k: int) -> pl.Series:
+    rows, cols = np.nonzero(contrib)
+    if len(rows) == 0:
+        return pl.Series("reasons", [""] * out.height, dtype=pl.Utf8)
+    vals = contrib[rows, cols]
+    top = (pl.DataFrame({"row": rows, "col": cols, "val": vals, "abs": np.abs(vals)})
+           .sort(["row", "abs"], descending=[False, True]).group_by("row", maintain_order=True).head(k))
+    texts = reason_texts()
+    frames = []
+    for j, name in enumerate(names):
+        sel = top.filter(c("col") == j)
+        if sel.is_empty():
+            continue
+        expr = texts[name].fill_null("").alias("t")
+        roots = list(dict.fromkeys(expr.meta.root_names()))
+        sub = out.select(roots)[sel["row"].to_numpy()] if roots else sel.select("row")
+        txt = sub.with_columns(expr)["t"]
+        sign = pl.when(c("val") >= 0).then(pl.lit("+")).otherwise(pl.lit("-"))
+        frames.append(sel.with_columns(t=txt).select(
+            "row", "abs", txt=c("t") + " [" + sign + c("val").abs().round(1).cast(pl.Utf8) + "]"))
+    joined = (pl.concat(frames).sort(["row", "abs"], descending=[False, True])
+              .group_by("row", maintain_order=True).agg(c("txt").str.join("; ")))
+    full = pl.DataFrame({"row": np.arange(out.height)}).join(joined, on="row", how="left", maintain_order="left")
+    return full["txt"].fill_null("").alias("reasons")
+
+
+def score(feats: pl.DataFrame, cfg: dict) -> pl.DataFrame:
     """Add ``shell_logit``, ``shell_probability``, ``shell_class`` and ``reasons``."""
     sc = cfg["scoring"]
     names = feature_names(cfg)
-    X = feats[[f"f_{n}" for n in names]].to_numpy(dtype=float)
+    X = feats.select([c(f"f_{n}").cast(pl.Float64) for n in names]).to_numpy()
     w = np.array([float(sc["weights"][n]) for n in names])
     contrib = X * w
-    out = feats.copy()
-    out["shell_logit"] = float(sc["intercept"]) + contrib.sum(axis=1)
-    out["shell_probability"] = 1.0 / (1.0 + np.exp(-out["shell_logit"]))
-    out["shell_class"] = classify(out["shell_probability"], sc["classes"])
-
-    # Reasons: top-k non-zero contributions per row, largest magnitude first.
-    rows, cols = np.nonzero(contrib)
-    if len(rows):
-        texts = reason_texts(out)
-        values = contrib[rows, cols]
-        text = np.empty(len(rows), dtype=object)
-        for j, name in enumerate(names):
-            sel = cols == j
-            if sel.any():
-                text[sel] = texts[name].to_numpy()[rows[sel]]
-        long = pd.DataFrame({"row": rows, "abs": np.abs(values), "txt": [f"{t} [{v:+.1f}]" for t, v in zip(text, values)]})
-        long = long.sort_values(["row", "abs"], ascending=[True, False])
-        long = long.groupby("row").head(int(sc.get("max_reasons", 4)))
-        reasons = long.groupby("row")["txt"].agg("; ".join)
-        out["reasons"] = pd.Series(reasons.reindex(np.arange(len(out))).fillna("").to_numpy(), index=out.index)
-    else:
-        out["reasons"] = ""
-    return out
+    logit = float(sc["intercept"]) + contrib.sum(axis=1)
+    out = feats.with_columns(shell_logit=pl.Series(logit), shell_probability=pl.Series(1.0 / (1.0 + np.exp(-logit))))
+    out = out.with_columns(shell_class=classify(c("shell_probability"), sc["classes"]))
+    if "parent_label" not in out.columns:
+        out = out.with_columns(parent_label=c("parent_pid"))
+    return out.with_columns(_reasons(out, names, contrib, int(sc.get("max_reasons", 4))))

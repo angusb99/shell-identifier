@@ -19,6 +19,13 @@ Outputs (``out_dir``)::
     truth/pd_labels.csv                   noisy PD / OOS labels: right count per parcel, sometimes on
                                           the wrong address (e.g. the shell instead of a unit)
     text/addresses_free_text.csv          the same addresses as messy free text
+    assets/                               the four pipeline inputs as standalone tables:
+        labelled_asset.parquet            address_detail_pid, label (PD / OOS)
+        ds_asset.parquet                  flattened G-NAF address view (upper-case names, flat / level /
+                                          geocode type *names*, retired rows, PRIMARY_PID)
+        bld.parquet                       building footprints (GeoParquet)
+        cad.parquet                       cadastre incl. strata and roads (GeoParquet)
+        datasets.yaml                     points the pipeline at them
 """
 
 from __future__ import annotations
@@ -1019,8 +1026,68 @@ def _free_text(r, rng) -> str:
     return text
 
 
+ASSETS_YAML = """# The synthetic stand-ins for the four inputs. Anything not set here comes from the
+# template (`shell-identifier datasets template`), including the column names.
+root: .
+labelled_asset:
+  table: labelled_asset
+ds_asset:
+  table: ds_asset
+bld:
+  table: bld
+cad:
+  table: cad
+"""
+
+
+def write_assets(out_dir: str | Path, seed: int = 0) -> Path:
+    """Write ``assets/`` - labelled_asset, ds_asset, bld and cad as standalone parquet tables.
+
+    ``ds_asset`` mimics a flattened G-NAF address view rather than the PSV release: one
+    row per address, upper-case column names, flat / level / geocode type names instead
+    of codes, the primary's PID on secondary rows, and retired rows to be filtered out.
+    """
+    import polars as pl
+
+    from ..loaders import load_gnaf
+
+    out_dir = Path(out_dir)
+    a_dir = out_dir / "assets"
+    a_dir.mkdir(parents=True, exist_ok=True)
+    g = load_gnaf(out_dir / "G-NAF").df
+    names = lambda col, table: pl.col(col).replace_strict(  # noqa: E731
+        list(table), [v[0] if isinstance(v, tuple) else v for v in table.values()], default=pl.col(col))
+    num_groups = ["lot_number", "flat_number", "level_number", "number_first", "number_last"]
+    passthrough = ["building_name"] + [f"{g_}{s}" for g_ in num_groups for s in ("_prefix", "", "_suffix")] + [
+        "street_name", "street_type_code", "street_suffix_code", "locality_name", "postcode", "legal_parcel_id",
+        "alias_principal", "primary_secondary"]
+    view = g.select(
+        pl.col("address_pid").alias("ADDRESS_DETAIL_PID"),
+        *[pl.col(k).alias(k.upper()) for k in passthrough],
+        names("flat_type_code", aut.FLAT_TYPES).alias("FLAT_TYPE"),
+        names("level_type_code", aut.LEVEL_TYPES).alias("LEVEL_TYPE"),
+        pl.col("state").alias("STATE_ABBREVIATION"),
+        pl.col("ps_primary_pid").alias("PRIMARY_PID"),
+        names("geocode_type", aut.GEOCODE_TYPES).alias("GEOCODE_TYPE"),
+        pl.col("x").alias("LONGITUDE"),
+        pl.col("y").alias("LATITUDE"),
+        pl.lit(None, dtype=pl.Utf8).alias("DATE_RETIRED"),
+    )
+    retired = view.sample(fraction=0.01, seed=seed).with_columns(
+        ("GANSWRET" + pl.int_range(pl.len()).cast(pl.Utf8).str.zfill(6)).alias("ADDRESS_DETAIL_PID"),
+        pl.lit("2025-06-30").alias("DATE_RETIRED"))
+    pl.concat([view, retired]).write_parquet(a_dir / "ds_asset.parquet")
+    pl.read_csv(out_dir / "truth" / "pd_labels.csv").write_parquet(a_dir / "labelled_asset.parquet")
+    gpd.read_file(out_dir / "Buildings" / f"{STATE}_BUILDINGS.gpkg", layer="buildings").to_parquet(a_dir / "bld.parquet")
+    gpd.read_file(out_dir / "Cadastre" / f"{STATE}_CADASTRE.gpkg", layer="cadastre").to_parquet(a_dir / "cad.parquet")
+    (a_dir / "datasets.yaml").write_text(ASSETS_YAML, encoding="utf-8")
+    return a_dir
+
+
 def generate(out_dir: str | Path, n_parcels: int = 1500, seed: int = 42) -> dict:
     """Generate the synthetic datasets into ``out_dir`` and return a summary dict."""
     builder = Builder(seed=seed)
     builder.layout(n_parcels)
-    return builder.write(Path(out_dir))
+    summary = builder.write(Path(out_dir))
+    summary["assets"] = str(write_assets(out_dir, seed))
+    return summary

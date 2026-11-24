@@ -1,13 +1,13 @@
-"""Verify labelled dwellings (and find shells), or predict dwellings on unlabelled data."""
+"""Verify labelled dwellings (and find shells), or predict dwellings on unlabelled data (polars)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-import geopandas as gpd
 import numpy as np
-import pandas as pd
+import polars as pl
 
+from ..frames import c, int_text, join_nonempty, left_join, lookup, markdown_table
 from .countem import CountConstrainedEM, EMSettings, _logit, conditional_marginals
 from .features import dwelling_features
 from .labels import parcel_counts
@@ -20,198 +20,211 @@ ASSIGNMENT_COLUMNS = [
 ]
 
 
-def _join(parts: list[pd.Series], sep: str = "; ") -> pd.Series:
-    out = pd.Series("", index=parts[0].index, dtype=object)
-    for p in parts:
-        p = p.fillna("").astype(str)
-        out = pd.Series(np.where((out != "") & (p != ""), out + sep + p, np.where(out == "", p, out)), index=out.index)
-    return out
+def _txt(cond: pl.Expr, text: pl.Expr) -> pl.Expr:
+    return pl.when(cond).then(text).otherwise(pl.lit(""))
 
 
-def _txt(cond, text) -> pd.Series:
-    return pd.Series(np.where(cond, text, ""), index=cond.index, dtype=object)
-
-
-def evidence(s: pd.DataFrame, F: pd.DataFrame) -> pd.Series:
+def evidence(s: pl.DataFrame, F: pl.DataFrame) -> pl.Series:
     """Short plain-text summary of what the model saw for each address."""
-    i = lambda x: x.round(0).astype("Int64").astype(str)  # noqa: E731
-    kind = np.select(
-        [s["node_type"] == "street", s["node_type"] == "level", s["node_type"] == "structure"],
-        ["street address", "level address", "building address"],
-        s["flat_type_code"].replace("", "unit") + " (" + s["node_type"] + ")",
-    )
-    kind = pd.Series(kind, index=s.index)
-    stack = np.expm1(F["g_stack_size"])
-    levels = F["b_levels"]
-    bld = _txt(s["building_pid"].notna(), "building " + i(levels.fillna(1)) + " storey(s), "
-               + i(F["b_addr_count"]) + " address(es)")
-    out_b = _txt(s["building_pid"].isna() & (s["n_dwelling_buildings"] > 0), "geocode outside buildings")
-    stk = _txt(stack > 1, "geocode shared by " + i(stack) + " addresses")
-    kids = _txt(s["n_desc"] > 0, i(s["n_desc"]) + " nested beneath")
-    rng = _txt(s["n_range_desc"] > 0, "range covers " + i(s["n_range_numbers"]) + " number(s)")
-    sfx = _txt(s["n_suffix_variants"] > 0, "suffix siblings " + s["suffix_list"].astype(str))
-    n_parcel = s["n_parcel_others"] + s["in_ctx"].astype(int)
-    strata = _txt(s["total_strata_count"].fillna(0) > 0, ", strata " + i(s["total_strata_count"].fillna(0)))
-    parcel = "parcel " + i(n_parcel) + " address(es), " + i(s["n_dwelling_buildings"]) + " dwelling-size building(s)" + strata
-    return _join([kind, bld, out_b, stk, kids, rng, sfx, parcel])
+    df = s.with_columns(_levels=F["b_levels"], _baddr=F["b_addr_count"],
+                        _stack=pl.len().over(["parcel_pid", "xy_key"]))
+    ftype = pl.when(c("flat_type_code") == "").then(pl.lit("unit")).otherwise(c("flat_type_code"))
+    kind = (pl.when(c("node_type") == "street").then(pl.lit("street address"))
+            .when(c("node_type") == "level").then(pl.lit("level address"))
+            .when(c("node_type") == "structure").then(pl.lit("building address"))
+            .otherwise(ftype + " (" + c("node_type") + ")"))
+    strata = _txt(c("total_strata_count").fill_null(0) > 0, ", strata " + int_text(c("total_strata_count")))
+    n_parcel = c("n_parcel_others") + c("in_ctx").cast(pl.Int64)
+    expr = join_nonempty([
+        kind,
+        _txt(c("building_pid").is_not_null(), "building " + int_text(c("_levels").fill_null(1)) + " storey(s), "
+             + int_text(c("_baddr")) + " address(es)"),
+        _txt(c("building_pid").is_null() & (c("n_dwelling_buildings") > 0), pl.lit("geocode outside buildings")),
+        _txt(c("_stack") > 1, "geocode shared by " + int_text(c("_stack")) + " addresses"),
+        _txt(c("n_desc") > 0, int_text(c("n_desc")) + " nested beneath"),
+        _txt(c("n_range_desc") > 0, "range covers " + int_text(c("n_range_numbers")) + " number(s)"),
+        _txt(c("n_suffix_variants") > 0, "suffix siblings " + c("suffix_list")),
+        "parcel " + int_text(n_parcel) + " address(es), " + int_text(c("n_dwelling_buildings"))
+        + " dwelling-size building(s)" + strata,
+    ], "; ")
+    return df.select(expr.alias("evidence")).to_series()
 
 
-def _prepare(ctx: dict) -> tuple[pd.DataFrame, pd.DataFrame]:
-    s = pd.DataFrame(ctx["scored"].drop(columns="geometry")).reset_index(drop=True)
-    F = dwelling_features(s, ctx["parcels_m"], ctx["buildings_m"])
-    return s, F
+def _prepare(ctx: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
+    s = ctx["scored"]
+    return s, dwelling_features(s, ctx["parcels_m"], ctx["buildings_m"])
 
 
-def verify(ctx: dict, labels: pd.DataFrame, settings: EMSettings | None = None,
-           counts: pd.DataFrame | None = None, log=print) -> dict:
+def _with_labels(s: pl.DataFrame, labels: pl.DataFrame | None) -> pl.DataFrame:
+    s = s.drop([k for k in ("y", "input_label") if k in s.columns])
+    if labels is None or labels.is_empty():
+        return s.with_columns(y=pl.lit(-1, dtype=pl.Int64), input_label=pl.lit(""))
+    lab = labels.select(c("address_pid").cast(pl.Utf8), "y", c("label_raw").alias("input_label"))
+    return left_join(s, lab, "address_pid").with_columns(c("y").fill_null(-1), c("input_label").fill_null(""))
+
+
+def verify(ctx: dict, labels: pl.DataFrame, settings: EMSettings | None = None,
+           counts: pl.DataFrame | None = None, log=print) -> dict:
     """Fit the count-constrained model on labelled parcels and assign dwellings and shells.
 
     Parcels with labels get exactly their labelled number of dwellings (cross-fitted
     posteriors); parcels without labels are predicted by the final model.
     """
     s, F = _prepare(ctx)
-    lab = labels.set_index("address_pid")
-    s["y"] = s["address_pid"].map(lab["y"]).fillna(-1).astype(int)
-    s["input_label"] = s["address_pid"].map(lab["label_raw"]).fillna("")
-    k = parcel_counts(s["parcel_pid"], s["y"], counts)
-    train = (s["parcel_pid"].isin(k.index) & (s["parcel_pid"] != "")).to_numpy()
+    s = _with_labels(s, labels)
+    k = parcel_counts(s, counts)
+    k_map = dict(zip(k["parcel_pid"].to_list(), k["k"].to_list()))
+    train = (s["parcel_pid"].is_in(k["parcel_pid"].implode()) & (s["parcel_pid"] != "")).to_numpy()
     if not train.any():
-        raise ValueError("no labelled address could be matched to a parcel; check the id column")
-    log(f"{train.sum():,} addresses on {len(k):,} labelled parcels; {int((s['y'] == 1).sum()):,} PD labels")
+        raise ValueError("no labelled address could be matched to a parcel; check the address id column")
+    log(f"{int(train.sum()):,} addresses on {k.height:,} labelled parcels; {int((s['y'] == 1).sum()):,} PD labels")
 
-    em = CountConstrainedEM(settings).fit(F.to_numpy()[train], s.loc[train, "parcel_pid"].to_numpy(), k,
-                                          s.loc[train, "y"].to_numpy(), log=log)
-    s["dwelling_prob"] = np.nan
-    s["posterior"] = np.nan
-    s["assigned_dwelling"] = False
-    s.loc[train, "dwelling_prob"] = em.oof_prob
-    s.loc[train, "posterior"] = em.posterior
-    s.loc[train, "assigned_dwelling"] = em.assigned
+    X = F.to_numpy()
+    parcel = s["parcel_pid"].to_numpy()
+    y = s["y"].to_numpy()
+    em = CountConstrainedEM(settings).fit(X[train], parcel[train], k_map, y[train], log=log)
+    prob, post, assigned = np.full(s.height, np.nan), np.full(s.height, np.nan), np.zeros(s.height, dtype=bool)
+    prob[train], post[train], assigned[train] = em.oof_prob, em.posterior, em.assigned
     if (~train).any():
-        prob = em.predict_proba(F.to_numpy()[~train])
-        s.loc[~train, "dwelling_prob"] = prob
-        s.loc[~train, "posterior"] = prob
-        s.loc[~train, "assigned_dwelling"] = prob >= 0.5
-    s["mode"] = np.where(train, "verified", "predicted")
-    s["k_parcel"] = s["parcel_pid"].map(k)
+        p = em.predict_proba(X[~train])
+        prob[~train], post[~train], assigned[~train] = p, p, p >= 0.5
+    s = s.with_columns(
+        dwelling_prob=pl.Series(prob), posterior=pl.Series(post), assigned_dwelling=pl.Series(assigned),
+        mode=pl.Series(np.where(train, "verified", "predicted")),
+        k_parcel=lookup(c("parcel_pid"), k["parcel_pid"], k["k"].cast(pl.Float64)),
+    )
     result = _finish(s, F)
-    result.update(em=em, features=F, bundle={
-        "model": em.model, "features": list(F.columns),
+    result.update(em=em, features=F, crs=ctx.get("crs"), bundle={
+        "model": em.model, "features": F.columns,
         "misplacement_prior": np.exp(em.log_prior_m).round(4).tolist(),
         "history": em.history, "settings": em.s.__dict__,
     })
     return result
 
 
-def predict(ctx: dict, bundle: dict, counts: pd.DataFrame | None = None) -> dict:
+def predict(ctx: dict, bundle: dict, counts: pl.DataFrame | None = None) -> dict:
     """Apply a saved model. With ``counts`` (parcel_pid, n_dwellings) those parcels get exactly that many."""
     s, F = _prepare(ctx)
-    X = F.reindex(columns=bundle["features"]).to_numpy()
+    X = F.select([c(k) if k in F.columns else pl.lit(None, dtype=pl.Float64).alias(k)
+                  for k in bundle["features"]]).to_numpy()
     prob = bundle["model"].predict_proba(X)[:, 1]
-    s["y"] = -1
-    s["input_label"] = ""
-    s["dwelling_prob"] = prob
-    s["posterior"] = prob
-    s["assigned_dwelling"] = prob >= 0.5
-    s["mode"] = "predicted"
-    s["k_parcel"] = np.nan
-    if counts is not None and not counts.empty:
-        k = counts.set_index(counts.columns[0])[counts.columns[1]].astype(int)
+    post, assigned = prob.copy(), prob >= 0.5
+    mode = np.full(s.height, "predicted", dtype=object)
+    k_parcel = np.full(s.height, np.nan)
+    if counts is not None and counts.height:
+        kc = counts.select(c(counts.columns[0]).cast(pl.Utf8).alias("parcel_pid"),
+                           c(counts.columns[1]).cast(pl.Int64).alias("k"))
+        k_map = dict(zip(kc["parcel_pid"].to_list(), kc["k"].to_list()))
         logits = _logit(prob)
-        for pid, idx in s[s["parcel_pid"].isin(k.index)].groupby("parcel_pid").indices.items():
-            kk = int(k[pid])
-            q = conditional_marginals(logits[idx], kk)
+        groups = (s.select("parcel_pid").with_row_index("_i").filter(c("parcel_pid").is_in(kc["parcel_pid"].implode()))
+                  .group_by("parcel_pid").agg("_i"))
+        for pid, idx in groups.iter_rows():
+            idx = np.asarray(idx, dtype=np.int64)
+            kk = int(k_map[pid])
+            post[idx] = conditional_marginals(logits[idx], kk)
             sel = np.zeros(len(idx), dtype=bool)
             sel[np.argsort(-logits[idx], kind="stable")[:kk]] = True
-            s.loc[idx, "posterior"] = q
-            s.loc[idx, "assigned_dwelling"] = sel
-            s.loc[idx, "mode"] = "counted"
-            s.loc[idx, "k_parcel"] = kk
-    return _finish(s, F)
+            assigned[idx] = sel
+            mode[idx] = "counted"
+            k_parcel[idx] = kk
+    s = _with_labels(s, None).with_columns(
+        dwelling_prob=pl.Series(prob), posterior=pl.Series(post), assigned_dwelling=pl.Series(assigned),
+        mode=pl.Series(mode.astype(str)), k_parcel=pl.Series(k_parcel).fill_nan(None))
+    result = _finish(s, F)
+    result.update(features=F, crs=ctx.get("crs"))
+    return result
 
 
-def _finish(s: pd.DataFrame, F: pd.DataFrame) -> dict:
-    s["assigned_dwelling"] = s["assigned_dwelling"].astype(bool)
+def _finish(s: pl.DataFrame, F: pl.DataFrame) -> dict:
+    s = s.with_columns(c("assigned_dwelling").cast(pl.Boolean))
     roles = assign_roles(s, s["assigned_dwelling"].to_numpy())
-    s = s.join(roles.drop(columns="address_pid"))
-    labels = s.set_index("address_pid")["address_label"]
-    s["primary_shell_label"] = s["primary_shell_pid"].map(labels).fillna("")
-    s["rank_in_parcel"] = s.groupby("parcel_pid")["posterior"].rank(ascending=False, method="first")
-    s.loc[s["parcel_pid"] == "", "rank_in_parcel"] = np.nan
-    labelled_pd = s["y"] == 1
-    s["label_change"] = np.select(
-        [labelled_pd & ~s["assigned_dwelling"], (s["y"] == 0) & s["assigned_dwelling"],
-         (s["y"] == -1) & s["assigned_dwelling"] & (s["mode"] == "verified")],
-        ["PD->OOS", "OOS->PD", "unlabelled->PD"], "")
-    n_parcel = s.groupby("parcel_pid")["address_pid"].transform("size")
-    rank = s["rank_in_parcel"].round(0).astype("Int64").astype(str)
-    s["decision"] = np.where(
-        s["mode"].isin(["verified", "counted"]),
-        "parcel has " + s["k_parcel"].round(0).astype("Int64").astype(str) + " dwelling(s); ranked " + rank + "/"
-        + n_parcel.astype(str) + ", posterior " + s["posterior"].round(2).astype(str),
-        "dwelling probability " + s["dwelling_prob"].round(2).astype(str),
+    s = s.drop([k for k in roles.columns if k != "address_pid" and k in s.columns]).hstack(roles.drop("address_pid"))
+    assigned, y = c("assigned_dwelling"), c("y")
+    rank = pl.when(c("parcel_pid") != "").then(c("posterior").rank("ordinal", descending=True).over("parcel_pid"))
+    s = s.with_columns(
+        primary_shell_label=lookup(c("primary_shell_pid"), s["address_pid"], s["address_label"], default=""),
+        rank_in_parcel=rank.cast(pl.Int64),
+        label_change=pl.when((y == 1) & ~assigned).then(pl.lit("PD->OOS"))
+        .when((y == 0) & assigned).then(pl.lit("OOS->PD"))
+        .when((y == -1) & assigned & (c("mode") == "verified")).then(pl.lit("unlabelled->PD"))
+        .otherwise(pl.lit("")),
     )
-    s["evidence"] = evidence(s, F).to_numpy()
-
-    verified = s[s["mode"] == "verified"]
-    moves = pair_moves(verified[["parcel_pid", "address_pid", "address_label", "y", "assigned_dwelling", "posterior"]]
-                       .rename(columns={"assigned_dwelling": "assigned"})) if len(verified) else pd.DataFrame()
+    n_parcel = pl.len().over("parcel_pid").cast(pl.Utf8)
+    s = s.with_columns(
+        decision=pl.when(c("mode").is_in(["verified", "counted"]))
+        .then("parcel has " + int_text(c("k_parcel")) + " dwelling(s); ranked " + int_text(c("rank_in_parcel"))
+              + "/" + n_parcel + ", posterior " + c("posterior").round(2).cast(pl.Utf8))
+        .otherwise("dwelling probability " + c("dwelling_prob").round(2).cast(pl.Utf8)),
+    )
+    s = s.with_columns(evidence(s, F))
+    verified = s.filter(c("mode") == "verified")
+    moves = (pair_moves(verified.select("parcel_pid", "address_pid", "address_label", "y", "posterior",
+                                        assigned=c("assigned_dwelling")))
+             if verified.height else pl.DataFrame())
     return {"assignments": s, "parcels": summarise(s), "moves": moves}
 
 
-def summarise(s: pd.DataFrame) -> pd.DataFrame:
-    p = s[s["parcel_pid"] != ""].assign(
-        _pd=lambda d: d["y"] == 1, _moved=lambda d: d["label_change"] == "PD->OOS",
-        _primary=lambda d: d["role"] == PRIMARY, _sub=lambda d: d["role"] == SUB, _oos=lambda d: d["role"] == OOS)
-    g = p.groupby("parcel_pid")
-    assigned_post = p["posterior"].where(p["assigned_dwelling"])
-    other_post = p["posterior"].where(~p["assigned_dwelling"])
-    out = pd.DataFrame({
-        "mode": g["mode"].first(),
-        "n_addresses": g.size(),
-        "labelled_pd": g["_pd"].sum(),
-        "assigned_dwellings": g["assigned_dwelling"].sum(),
-        "expected_dwellings": g["dwelling_prob"].sum().round(2),
-        "n_label_changes": g["_moved"].sum(),
-        "n_primary_shells": g["_primary"].sum(),
-        "n_sub_shells": g["_sub"].sum(),
-        "n_out_of_scope": g["_oos"].sum(),
-        "margin": (assigned_post.groupby(p["parcel_pid"]).min().fillna(1.0)
-                   - other_post.groupby(p["parcel_pid"]).max().fillna(0.0)).round(3),
-    })
-    prim = p[p["role"] == PRIMARY].groupby("parcel_pid")
-    out["primary_shell_pids"] = prim["address_pid"].agg(";".join).reindex(out.index).fillna("")
-    out["primary_shell_labels"] = prim["address_label"].agg(" | ".join).reindex(out.index).fillna("")
-    out["status"] = np.select(
-        [out["mode"] != "verified", out["n_label_changes"] > 0],
-        ["PREDICTED", "LABELS_MOVED"], "AGREES_WITH_LABELS")
-    out["review"] = out["margin"] < 0.3
-    return out.reset_index()
+def summarise(s: pl.DataFrame) -> pl.DataFrame:
+    p = s.filter(c("parcel_pid") != "")
+    assigned, role = c("assigned_dwelling"), c("role")
+    out = p.group_by("parcel_pid").agg(
+        c("mode").first(),
+        pl.len().alias("n_addresses"),
+        (c("y") == 1).sum().alias("labelled_pd"),
+        assigned.sum().alias("assigned_dwellings"),
+        c("dwelling_prob").sum().round(2).alias("expected_dwellings"),
+        (c("label_change") == "PD->OOS").sum().alias("n_label_changes"),
+        (role == PRIMARY).sum().alias("n_primary_shells"),
+        (role == SUB).sum().alias("n_sub_shells"),
+        (role == OOS).sum().alias("n_out_of_scope"),
+        c("posterior").filter(assigned).min().alias("_lo"),
+        c("posterior").filter(~assigned).max().alias("_hi"),
+        c("address_pid").filter(role == PRIMARY).str.join(";").alias("primary_shell_pids"),
+        c("address_label").filter(role == PRIMARY).str.join(" | ").alias("primary_shell_labels"),
+    ).sort("parcel_pid")
+    out = out.with_columns(margin=(c("_lo").fill_null(1.0) - c("_hi").fill_null(0.0)).round(3)).drop("_lo", "_hi")
+    order = ["parcel_pid", "mode", "n_addresses", "labelled_pd", "assigned_dwellings", "expected_dwellings",
+             "n_label_changes", "n_primary_shells", "n_sub_shells", "n_out_of_scope", "margin",
+             "primary_shell_pids", "primary_shell_labels"]
+    return out.select(order).with_columns(
+        status=pl.when(c("mode") != "verified").then(pl.lit("PREDICTED"))
+        .when(c("n_label_changes") > 0).then(pl.lit("LABELS_MOVED")).otherwise(pl.lit("AGREES_WITH_LABELS")),
+        review=c("margin") < 0.3,
+    )
 
 
-def write_outputs(result: dict, out_dir: str | Path, geometry: gpd.GeoSeries | None = None,
-                  write_features: bool = False) -> dict[str, Path]:
+def write_outputs(result: dict, out_dir: str | Path, gpkg: bool = True, write_features: bool = False,
+                  parquet: bool = True) -> dict[str, Path]:
+    """CSV (and parquet) tables, an optional point GeoPackage, the model bundle and a report."""
     import joblib
+
+    from ..pipeline import write_geopackage
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     s = result["assignments"]
     paths = {"assignments_csv": out_dir / "dwelling_assignments.csv", "parcels_csv": out_dir / "parcel_dwellings.csv"}
-    table = s[ASSIGNMENT_COLUMNS].copy()
-    for c in ("dwelling_prob", "posterior"):
-        table[c] = table[c].round(4)
-    table.to_csv(paths["assignments_csv"], index=False)
-    result["parcels"].to_csv(paths["parcels_csv"], index=False)
-    if len(result.get("moves", [])):
+    table = s.select(ASSIGNMENT_COLUMNS).with_columns(c("dwelling_prob").round(4), c("posterior").round(4))
+    table.write_csv(paths["assignments_csv"])
+    if parquet:
+        paths["assignments_parquet"] = out_dir / "dwelling_assignments.parquet"
+        table.write_parquet(paths["assignments_parquet"])
+    result["parcels"].write_csv(paths["parcels_csv"])
+    if result.get("moves") is not None and result["moves"].height:
         paths["moves_csv"] = out_dir / "label_moves.csv"
-        result["moves"].to_csv(paths["moves_csv"], index=False)
-    if geometry is not None:
+        result["moves"].write_csv(paths["moves_csv"])
+    if gpkg and {"x", "y"} <= set(s.columns):
         paths["assignments_gpkg"] = out_dir / "dwelling_assignments.gpkg"
-        gpd.GeoDataFrame(table, geometry=geometry.to_numpy(), crs=geometry.crs).to_file(
-            paths["assignments_gpkg"], layer="dwelling_assignments", driver="GPKG", engine="pyogrio")
+        write_geopackage(table.with_columns(s.select("x", "y")), paths["assignments_gpkg"], "dwelling_assignments",
+                         result.get("crs"))
     if write_features:
+        feats = result["features"].with_columns(address_pid=s["address_pid"]).select(
+            ["address_pid"] + result["features"].columns)
         paths["features_csv"] = out_dir / "dwelling_features.csv"
-        result["features"].assign(address_pid=s["address_pid"].to_numpy()).to_csv(paths["features_csv"], index=False)
+        feats.write_csv(paths["features_csv"])
+        if parquet:
+            paths["features_parquet"] = out_dir / "dwelling_features.parquet"
+            feats.write_parquet(paths["features_parquet"])
     if "bundle" in result:
         paths["model"] = out_dir / "dwelling_model.joblib"
         joblib.dump(result["bundle"], paths["model"])
@@ -220,7 +233,7 @@ def write_outputs(result: dict, out_dir: str | Path, geometry: gpd.GeoSeries | N
     return paths
 
 
-def feature_importance(result: dict, max_rows: int = 8000, seed: int = 0) -> pd.Series:
+def feature_importance(result: dict, max_rows: int = 8000, seed: int = 0) -> pl.DataFrame:
     """Permutation importance (drop in log-likelihood) of the final model on the assigned targets."""
     from sklearn.inspection import permutation_importance
 
@@ -231,33 +244,32 @@ def feature_importance(result: dict, max_rows: int = 8000, seed: int = 0) -> pd.
         rows = rng.choice(rows, max_rows, replace=False)
     y = s["assigned_dwelling"].to_numpy()[rows].astype(int)
     if len(np.unique(y)) < 2:
-        return pd.Series(dtype=float)
+        return pl.DataFrame({"feature": [], "importance": []}, schema={"feature": pl.Utf8, "importance": pl.Float64})
     imp = permutation_importance(result["bundle"]["model"], F.to_numpy()[rows], y, scoring="neg_log_loss",
                                  n_repeats=2, random_state=seed)
-    return pd.Series(imp.importances_mean, index=F.columns).sort_values(ascending=False)
+    return pl.DataFrame({"feature": F.columns, "importance": imp.importances_mean}).sort("importance", descending=True)
 
 
 def model_report(result: dict) -> str:
     s, parcels, em = result["assignments"], result["parcels"], result["em"]
-    v = parcels[parcels["mode"] == "verified"]
-    hist = pd.DataFrame(em.history)
+    v = parcels.filter(c("mode") == "verified")
+    hist = pl.DataFrame(em.history)
+    role_counts = ", ".join(f"{r} {int((s['role'] == r).sum()):,}" for r in (DWELLING, PRIMARY, SUB, OOS))
     lines = [
         "# Dwelling model report", "",
-        f"* Labelled parcels: {len(v):,} ({int((v['n_addresses'] > 1).sum()):,} with more than one address)",
+        f"* Labelled parcels: {v.height:,} ({int((v['n_addresses'] > 1).sum()):,} with more than one address)",
         f"* PD labels: {int((s['y'] == 1).sum()):,}; out of scope: {int((s['y'] == 0).sum()):,}; "
         f"unlabelled on labelled parcels: {int(((s['y'] == -1) & (s['mode'] == 'verified')).sum()):,}",
         f"* PD labels moved to another address: **{int((s['label_change'] == 'PD->OOS').sum()):,}** "
         f"on {int((v['n_label_changes'] > 0).sum()):,} parcels",
         f"* Parcels flagged for review (margin < 0.3): {int(v['review'].sum()):,}",
         "* Estimated misplaced PD labels per parcel, P(m = 0, 1, 2, ...): "
-        + ", ".join(f"{v:.3f}" for v in np.exp(em.log_prior_m)),
-        f"* Roles: " + ", ".join(f"{r} {int((s['role'] == r).sum()):,}" for r in (DWELLING, PRIMARY, SUB, OOS)),
-        "", "## EM iterations", "", "| " + " | ".join(hist.columns) + " |", "|" + "---|" * len(hist.columns),
+        + ", ".join(f"{x:.3f}" for x in np.exp(em.log_prior_m)),
+        f"* Roles: {role_counts}",
+        "", "## EM iterations", "", markdown_table(hist),
     ]
-    lines += ["| " + " | ".join(str(x) for x in row) + " |" for row in hist.itertuples(index=False)]
     imp = feature_importance(result)
-    if len(imp):
+    if imp.height:
         lines += ["", "## Most influential features (permutation importance)", "",
-                  "| feature | importance |", "|---|---|"]
-        lines += [f"| {k} | {v:.4f} |" for k, v in imp.head(25).items()]
+                  markdown_table(imp.head(25).with_columns(c("importance").round(4)))]
     return "\n".join(lines) + "\n"

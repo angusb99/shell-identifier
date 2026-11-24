@@ -21,16 +21,17 @@ def test_loaders_read_synthetic_products(synth):
     out, summary = synth
     gnaf = load_gnaf(out / "G-NAF")
     assert len(gnaf) == summary["addresses"]          # retired records are dropped
-    assert gnaf.crs.to_epsg() == 7844
-    assert {"address_pid", "street_name", "flat_type_code", "geocode_type", "n_ps_secondaries"} <= set(gnaf.columns)
-    assert gnaf.attrs["localities"] and gnaf.attrs["localities"] <= {"TESTWOOD", "SAMPLE HILL", "MOCKTON PARK"}
+    assert gnaf.crs == "EPSG:7844"
+    assert {"address_pid", "street_name", "flat_type_code", "geocode_type", "n_ps_secondaries", "x", "y"}         <= set(gnaf.df.columns)
+    assert gnaf.meta["localities"] and gnaf.meta["localities"] <= {"TESTWOOD", "SAMPLE HILL", "MOCKTON PARK"}
     parcels, strata = load_cadastre(out / "Cadastre" / "NSW_CADASTRE.gpkg")
-    assert (parcels["base_parcel"] == "Yes").all()
-    assert len(strata) > 0
+    assert (parcels.df["base_parcel"] == "Yes").all()
+    assert len(strata) > 0 and parcels.geom is not None and len(parcels.geom) == len(parcels)
     b = load_buildings(out / "Buildings" / "NSW_BUILDINGS.gpkg")
-    assert b["est_levels"].min() >= 1
-    assert len(load_building_address(out / "Buildings" / "NSW_BUILDINGS.gpkg")) > 0
-    assert len(load_building_cadastre(out / "Buildings" / "NSW_BUILDINGS.gpkg")) > 0
+    assert b.df["est_levels"].min() >= 1
+    links = load_building_address(out / "Buildings" / "NSW_BUILDINGS.gpkg")
+    assert links.height > 0 and links["address_pid"].str.starts_with("GA").all()   # G-NAF ids, not Geoscape's
+    assert load_building_cadastre(out / "Buildings" / "NSW_BUILDINGS.gpkg").height > 0
 
 
 @pytest.mark.parametrize("mode", ["gnaf", "text"])

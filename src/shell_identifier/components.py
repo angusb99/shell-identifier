@@ -11,6 +11,9 @@ Every address is reduced to:
 
 Address B nests inside address A when they share street and number, every
 component A has is equal in B, and B has at least one component A lacks.
+
+All columns are polars expressions; authority lookups and the building-name
+regex run once per distinct value.
 """
 
 from __future__ import annotations
@@ -18,8 +21,7 @@ from __future__ import annotations
 import re
 from functools import lru_cache
 
-import numpy as np
-import pandas as pd
+import polars as pl
 
 from .authority import (
     FLAT_TYPES,
@@ -30,10 +32,12 @@ from .authority import (
     normalise_street_suffix,
     normalise_street_type,
 )
+from .frames import c, canon_num, clean_str, join_nonempty, map_values
 from .parser import FIELDS
 
 MASK_BITS = {"comp_structure": 4, "comp_level": 2, "comp_flat": 1}
 COMP_COLS = list(MASK_BITS)
+NUMBER_FIELDS = ("flat_number", "level_number", "number_first", "number_last", "lot_number")
 
 _STRUCT_WORDS = r"TOWER|TWR|BUILDING|BLDG|BLD|BLOCK|BLCK|BLK|WING"
 _STRUCT_CANON = {"TOWER": "TOWER", "TWR": "TOWER", "BUILDING": "BUILDING", "BLDG": "BUILDING",
@@ -67,105 +71,100 @@ def split_building_name(name: str) -> tuple[str, str]:
     return struct, re.sub(r"\s+", " ", vanity)
 
 
-def _clean(s: pd.Series) -> pd.Series:
-    s = s.astype(object).where(s.notna(), "")
-    s = s.astype(str).str.strip().str.upper()
-    return s.replace({"NAN": "", "NONE": "", "<NA>": ""})
+def _part(prefix: str) -> pl.Expr:
+    """prefix + number + suffix of a G-NAF number group (e.g. flat_number_prefix, flat_number, flat_number_suffix)."""
+    return c(f"{prefix}_prefix") + c(prefix) + c(f"{prefix}_suffix")
 
 
-def _canon_num(s: pd.Series) -> pd.Series:
-    """'01' -> '1', '12.0' -> '12'; keeps decimals like '3.04'."""
-    s = s.str.replace(r"\.0+$", "", regex=True)
-    return s.str.replace(r"^0+(?=\d)", "", regex=True)
+def _or_question(col: str) -> pl.Expr:
+    return pl.when(c(col) == "").then(pl.lit("?")).otherwise(c(col))
 
 
-def _join(parts: list[pd.Series], sep: str) -> pd.Series:
-    out = pd.Series("", index=parts[0].index, dtype=object)
-    for p in parts:
-        p = p.astype(object).where(p.notna(), "").astype(str).str.strip()
-        both = (out != "") & (p != "")
-        out = pd.Series(np.where(both, out + sep + p, np.where(out == "", p, out)), index=out.index, dtype=object)
-    return out
-
-
-def build_components(df: pd.DataFrame) -> pd.DataFrame:
+def build_components(df: pl.DataFrame) -> pl.DataFrame:
     """Add canonical component columns to a frame of G-NAF style address fields."""
-    out = df.copy()
-    for col in FIELDS:
-        out[col] = _clean(out[col]) if col in out else ""
-    for col in ("flat_number", "level_number", "number_first", "number_last", "lot_number"):
-        out[col] = _canon_num(out[col])
-
-    out["flat_type_code"] = out["flat_type_code"].map(normalise_flat_type)
-    out["level_type_code"] = out["level_type_code"].map(normalise_level_type)
-    out["street_type_code"] = out["street_type_code"].map(normalise_street_type)
-    out["street_suffix_code"] = out["street_suffix_code"].map(normalise_street_suffix)
+    out = df.with_columns([clean_str(col) if col in df.columns else pl.lit("").alias(col) for col in FIELDS])
+    out = out.with_columns([canon_num(col) for col in NUMBER_FIELDS])
+    out = out.with_columns(
+        map_values(out, "flat_type_code", normalise_flat_type).alias("flat_type_code"),
+        map_values(out, "level_type_code", normalise_level_type).alias("level_type_code"),
+        map_values(out, "street_type_code", normalise_street_type).alias("street_type_code"),
+        map_values(out, "street_suffix_code", normalise_street_suffix).alias("street_suffix_code"),
+    )
 
     # --- street and number ------------------------------------------------
-    out["street_key"] = _join([out["street_name"], out["street_type_code"], out["street_suffix_code"]], " ") \
-        + "|" + out["locality_name"] + "|" + out["state"]
-    nf = pd.to_numeric(out["number_first"], errors="coerce")
-    nl = pd.to_numeric(out["number_last"], errors="coerce")
-    has_range = nl.notna() & nf.notna() & (nl > nf)
-    out["num_first"] = nf.astype("Int64")
-    out["num_last"] = nl.where(has_range).astype("Int64")
-    first = out["number_first_prefix"] + out["number_first"] + out["number_first_suffix"]
-    last = out["number_last_prefix"] + out["number_last"] + out["number_last_suffix"]
-    lot = out["lot_number_prefix"] + out["lot_number"] + out["lot_number_suffix"]
-    out["num_key"] = np.where(
-        nf.notna(),
-        np.where(has_range, first + "-" + last, first),
-        np.where(lot != "", "LOT " + lot, ""),
+    nf = c("number_first").cast(pl.Float64, strict=False)
+    nl = c("number_last").cast(pl.Float64, strict=False)
+    has_range = nl.is_not_null() & nf.is_not_null() & (nl > nf)
+    first, last, lot = _part("number_first"), _part("number_last"), _part("lot_number")
+    num_key = (pl.when(nf.is_not_null()).then(pl.when(has_range).then(first + "-" + last).otherwise(first))
+               .when(lot != "").then("LOT " + lot).otherwise(pl.lit("")))
+    out = out.with_columns(
+        street_key=join_nonempty([c("street_name"), c("street_type_code"), c("street_suffix_code")], " ")
+        + "|" + c("locality_name") + "|" + c("state"),
+        num_first=nf.cast(pl.Int64, strict=False),
+        num_last=pl.when(has_range).then(nl).cast(pl.Int64, strict=False),
+        num_key=num_key,
+        num_suffix=pl.when(has_range).then(pl.lit("")).otherwise(c("number_first_suffix")),
+        base_num_key=pl.when(nf.is_not_null() & ~has_range).then(c("number_first_prefix") + c("number_first"))
+        .otherwise(num_key),
+        is_lot_only=nf.is_null() & (lot != ""),
     )
-    out["num_suffix"] = np.where(has_range, "", out["number_first_suffix"])
-    out["base_num_key"] = np.where(nf.notna() & ~has_range, out["number_first_prefix"] + out["number_first"], out["num_key"])
-    out["is_lot_only"] = nf.isna() & (lot != "")
 
     # --- sub-address components ---------------------------------------------
-    cat = out["flat_type_code"].map(flat_category)
-    flat_id = out["flat_number_prefix"] + out["flat_number"] + out["flat_number_suffix"]
-    has_flat = (out["flat_type_code"] != "") | (flat_id != "")
-    is_struct_flat = has_flat & (cat == "structure")
-    struct_from_flat = np.where(
-        is_struct_flat,
-        out["flat_type_code"].map(lambda c: _STRUCT_CANON.get(FLAT_TYPES.get(c, ("",))[0], c)) + " " + flat_id,
-        "",
+    names = out.get_column("building_name").unique()
+    split = [split_building_name(n) for n in names.to_list()]
+    struct_word = map_values(out, "flat_type_code",
+                             lambda code: _STRUCT_CANON.get(FLAT_TYPES.get(code, ("",))[0], code))
+    out = out.with_columns(
+        _cat=map_values(out, "flat_type_code", flat_category),
+        _struct_word=struct_word,
+        _struct_name=c("building_name").replace_strict(names, pl.Series([s for s, _ in split], dtype=pl.Utf8)),
+        vanity_name=c("building_name").replace_strict(names, pl.Series([v for _, v in split], dtype=pl.Utf8)),
+        _flat_id=_part("flat_number"),
+        _level_id=_part("level_number"),
     )
-    split = out["building_name"].map(split_building_name)
-    struct_from_name = split.map(lambda t: t[0])
-    out["vanity_name"] = split.map(lambda t: t[1])
-    out["comp_structure"] = np.where(struct_from_flat != "", struct_from_flat, struct_from_name)
-    out["comp_flat"] = np.where(has_flat & ~is_struct_flat, out["flat_type_code"].replace("", "?") + ":" + flat_id, "")
-    level_id = out["level_number_prefix"] + out["level_number"] + out["level_number_suffix"]
-    has_level = (out["level_type_code"] != "") | (level_id != "")
-    out["comp_level"] = np.where(has_level, out["level_type_code"].replace("", "?") + ":" + level_id, "")
-    out["flat_category"] = np.where(out["comp_flat"] != "", cat.replace("", "dwelling"), "")
-    finalise_components(out)
-    return out
+    has_flat = (c("flat_type_code") != "") | (c("_flat_id") != "")
+    is_struct_flat = has_flat & (c("_cat") == "structure")
+    has_level = (c("level_type_code") != "") | (c("_level_id") != "")
+    out = out.with_columns(
+        comp_structure=pl.when(is_struct_flat).then(c("_struct_word") + " " + c("_flat_id"))
+        .otherwise(c("_struct_name")),
+        comp_flat=pl.when(has_flat & ~is_struct_flat).then(_or_question("flat_type_code") + ":" + c("_flat_id"))
+        .otherwise(pl.lit("")),
+        comp_level=pl.when(has_level).then(_or_question("level_type_code") + ":" + c("_level_id"))
+        .otherwise(pl.lit("")),
+    ).with_columns(
+        flat_category=pl.when(c("comp_flat") != "")
+        .then(pl.when(c("_cat") == "").then(pl.lit("dwelling")).otherwise(c("_cat"))).otherwise(pl.lit("")),
+    ).drop("_cat", "_struct_word", "_struct_name", "_flat_id", "_level_id")
+    return finalise_components(out)
 
 
-def finalise_components(out: pd.DataFrame) -> None:
-    """(Re)compute ``mask``, ``specificity`` and ``node_type`` from the comp columns, in place."""
-    out["mask"] = sum((out[c] != "").astype(int) * bit for c, bit in MASK_BITS.items())
-    out["specificity"] = sum((out[c] != "").astype(int) for c in COMP_COLS)
-    out["node_type"] = np.select(
-        [out["comp_flat"] != "", out["comp_level"] != "", out["comp_structure"] != ""],
-        [out["flat_category"], "level", "structure"],
-        "street",
+def finalise_components(df: pl.DataFrame) -> pl.DataFrame:
+    """(Re)compute ``mask``, ``specificity`` and ``node_type`` from the comp columns."""
+    has = {col: (c(col) != "").cast(pl.Int64) for col in COMP_COLS}
+    return df.with_columns(
+        mask=pl.sum_horizontal([has[col] * bit for col, bit in MASK_BITS.items()]),
+        specificity=pl.sum_horizontal(list(has.values())),
+        node_type=pl.when(c("comp_flat") != "").then(c("flat_category"))
+        .when(c("comp_level") != "").then(pl.lit("level"))
+        .when(c("comp_structure") != "").then(pl.lit("structure"))
+        .otherwise(pl.lit("street")),
     )
 
 
-def format_label(df: pd.DataFrame) -> pd.Series:
+def format_label(df: pl.DataFrame) -> pl.Series:
     """G-NAF style single-line label, e.g. ``UNIT 5, LEVEL 2, 25 SMITH STREET, TESTWOOD NSW 2999``."""
-    flat_name = df["flat_type_code"].map(lambda c: FLAT_TYPES.get(c, (c,))[0] if c else "")
-    flat = _join([flat_name, df["flat_number_prefix"] + df["flat_number"] + df["flat_number_suffix"]], " ")
-    level_name = df["level_type_code"].map(lambda c: LEVEL_TYPES.get(c, c) if c else "")
-    level = _join([level_name, df["level_number_prefix"] + df["level_number"] + df["level_number_suffix"]], " ")
-    first = df["number_first_prefix"] + df["number_first"] + df["number_first_suffix"]
-    last = df["number_last_prefix"] + df["number_last"] + df["number_last_suffix"]
-    number = pd.Series(np.where(last != "", first + "-" + last, first), index=df.index)
-    lot = df["lot_number_prefix"] + df["lot_number"] + df["lot_number_suffix"]
-    number = pd.Series(np.where((number == "") & (lot != ""), "LOT " + lot, number), index=df.index)
-    street = _join([number, df["street_name"], df["street_type_code"], df["street_suffix_code"]], " ")
-    place = _join([df["locality_name"], df["state"], df["postcode"]], " ")
-    return _join([df["building_name"], flat, level, street, place], ", ")
+    flat_name = map_values(df, "flat_type_code", lambda code: FLAT_TYPES.get(code, (code,))[0] if code else "")
+    level_name = map_values(df, "level_type_code", lambda code: LEVEL_TYPES.get(code, code) if code else "")
+    first, last, lot = _part("number_first"), _part("number_last"), _part("lot_number")
+    number = pl.when(last != "").then(first + "-" + last).otherwise(first)
+    number = pl.when((number == "") & (lot != "")).then("LOT " + lot).otherwise(number)
+    label = join_nonempty([
+        c("building_name"),
+        join_nonempty([flat_name, _part("flat_number")], " "),
+        join_nonempty([level_name, _part("level_number")], " "),
+        join_nonempty([number, c("street_name"), c("street_type_code"), c("street_suffix_code")], " "),
+        join_nonempty([c("locality_name"), c("state"), c("postcode")], " "),
+    ], ", ")
+    return df.select(label.alias("address_label")).to_series()

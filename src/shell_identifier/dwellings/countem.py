@@ -36,11 +36,20 @@ configuration under the same model.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
-import pandas as pd
+import polars as pl
 from scipy.special import gammaln, logsumexp
+
+
+def factorize(values) -> tuple[np.ndarray, list]:
+    """Integer codes in order of first appearance, and the distinct values."""
+    s = pl.Series(np.asarray(values).astype(str))
+    uniques = s.unique(maintain_order=True)
+    codes = s.replace_strict(uniques, pl.Series(np.arange(len(uniques), dtype=np.int64))).to_numpy()
+    return codes, uniques.to_list()
 
 
 def _log_sigmoid(x: np.ndarray) -> np.ndarray:
@@ -238,7 +247,7 @@ class CountConstrainedEM:
             z[idx] = swap_map(logits[idx], labelled[idx], int(kk), self.log_prior_m)
         return z
 
-    def fit(self, X: np.ndarray, parcel: np.ndarray, k_parcel: pd.Series, y: np.ndarray, log=print):
+    def fit(self, X: np.ndarray, parcel: np.ndarray, k_parcel: Mapping[str, int], y: np.ndarray, log=print):
         """Fit on labelled parcels.
 
         ``X`` rows are addresses, ``parcel`` their parcel ids, ``k_parcel`` the
@@ -249,12 +258,12 @@ class CountConstrainedEM:
 
         n = len(X)
         labelled = y == 1
-        codes, uniques = pd.factorize(parcel)
+        codes, uniques = factorize(parcel)
         order = np.argsort(codes, kind="stable")
         bounds = np.searchsorted(codes[order], np.arange(len(uniques) + 1))
         groups = [order[bounds[g]:bounds[g + 1]] for g in range(len(uniques))]
         sizes = np.array([len(g) for g in groups])
-        k = np.minimum(k_parcel.reindex(uniques).fillna(0).to_numpy(dtype=int), sizes)
+        k = np.minimum(np.array([int(k_parcel.get(u, 0)) for u in uniques], dtype=int), sizes)
 
         # Single-address parcels have a fixed answer: subsample them for training, reweighted.
         rng = np.random.default_rng(self.s.random_state)
