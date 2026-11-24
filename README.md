@@ -64,7 +64,7 @@ Run the tests with `.venv/Scripts/python -m pytest`.
 
 ## From polars LazyFrames
 
-The most direct way in: read the four inputs yourself and pass the frames. Only the columns that are needed are collected. For a step-by-step walkthrough, from preparing the inputs to reading the results and finding insights, see the [run guide](docs/run_guide.md).
+The most direct way in: read the four inputs yourself and pass the frames. Only the columns that are needed are collected. For a step-by-step walkthrough, from preparing the inputs to reading the results and finding insights, see the [run guide](docs/run_guide.md); for the mathematics behind the model, see the [technical report](docs/methodology.md).
 
 ```python
 import polars as pl

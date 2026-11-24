@@ -17,7 +17,7 @@ How to run the dwelling model from a notebook on the four inputs, read every out
 13. [Troubleshooting](#13-troubleshooting)
 14. [Assumptions and limits](#14-assumptions-and-limits)
 
-The code blocks run top to bottom in one notebook. Replace the `D:/data/...` paths with your own.
+The code blocks run top to bottom in one notebook. Replace the `D:/data/...` paths with your own. For the mathematics behind the model, see the [technical report](methodology.md).
 
 ---
 
@@ -536,7 +536,7 @@ a.filter(pl.col("address_pid") == pid).select(
 )
 ```
 
-`reasons` lists the strongest signals from the expert shell score, each with its weight in brackets. Positive weights push towards "shell", negative ones away. For example, `sub-address with nothing nested under it [-4.0]` means the address looks like a unit, not a container.
+`reasons` lists the strongest signals from the expert shell score, each with its contribution to the score in brackets (weight × feature value). Positive values push towards "shell", negative ones away. For example, `sub-address with nothing nested under it [-4.0]` means the address looks like a unit, not a container.
 
 ---
 
