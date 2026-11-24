@@ -31,28 +31,49 @@ def _txt(cond: pl.Expr, text: pl.Expr) -> pl.Expr:
     return pl.when(cond).then(text).otherwise(pl.lit(""))
 
 
+def _column(df: pl.DataFrame, name: str, height: int) -> pl.Series:
+    """``df[name]`` as floats, or all null when the inputs couldn't provide it (e.g. no building heights)."""
+    if name in df.columns:
+        return df[name].cast(pl.Float64)
+    return pl.Series(name, np.full(height, np.nan)).fill_nan(None)
+
+
 def evidence(s: pl.DataFrame, F: pl.DataFrame) -> pl.Series:
-    """Short plain-text summary of what the model saw for each address."""
-    df = s.with_columns(_levels=F["b_levels"], _baddr=F["b_addr_count"],
+    """Short plain-text summary of what the model saw for each address.
+
+    Anything unknown (storeys without floor area or roof height, buildings or strata
+    counts that weren't supplied) is left out of the text rather than guessed.
+    """
+    n = s.height
+    df = s.with_columns(_levels=_column(F, "b_levels", n), _baddr=_column(F, "b_addr_count", n),
                         _stack=pl.len().over(["parcel_pid", "xy_key"]))
+    df = df.with_columns([_column(df, k, n) for k in ("total_strata_count", "n_dwelling_buildings")
+                          if k not in df.columns])
+    if "building_pid" not in df.columns:
+        df = df.with_columns(building_pid=pl.lit(None, dtype=pl.Utf8))
+    known = lambda col: c(col).is_not_null()
     ftype = pl.when(c("flat_type_code") == "").then(pl.lit("unit")).otherwise(c("flat_type_code"))
     kind = (pl.when(c("node_type") == "street").then(pl.lit("street address"))
             .when(c("node_type") == "level").then(pl.lit("level address"))
             .when(c("node_type") == "structure").then(pl.lit("building address"))
             .otherwise(ftype + " (" + c("node_type") + ")"))
-    strata = _txt(c("total_strata_count").fill_null(0) > 0, ", strata " + int_text(c("total_strata_count")))
+    building = ("in a " + _txt(known("_levels"), int_text(c("_levels")) + "-storey ") + "building"
+                + _txt(known("_baddr"), " with " + int_text(c("_baddr")) + " address(es)"))
     n_parcel = c("n_parcel_others") + c("in_ctx").cast(pl.Int64)
+    parcel = ("parcel " + int_text(n_parcel) + " address(es)"
+              + _txt(known("n_dwelling_buildings"), ", " + int_text(c("n_dwelling_buildings"))
+                     + " dwelling-size building(s)")
+              + _txt(c("total_strata_count").fill_null(0) > 0, ", strata " + int_text(c("total_strata_count"))))
     expr = join_nonempty([
         kind,
-        _txt(c("building_pid").is_not_null(), "building " + int_text(c("_levels").fill_null(1)) + " storey(s), "
-             + int_text(c("_baddr")) + " address(es)"),
-        _txt(c("building_pid").is_null() & (c("n_dwelling_buildings") > 0), pl.lit("geocode outside buildings")),
+        _txt(known("building_pid"), building),
+        _txt(c("building_pid").is_null() & (c("n_dwelling_buildings").fill_null(0) > 0),
+             pl.lit("geocode outside buildings")),
         _txt(c("_stack") > 1, "geocode shared by " + int_text(c("_stack")) + " addresses"),
         _txt(c("n_desc") > 0, int_text(c("n_desc")) + " nested beneath"),
         _txt(c("n_range_desc") > 0, "range covers " + int_text(c("n_range_numbers")) + " number(s)"),
         _txt(c("n_suffix_variants") > 0, "suffix siblings " + c("suffix_list")),
-        "parcel " + int_text(n_parcel) + " address(es), " + int_text(c("n_dwelling_buildings"))
-        + " dwelling-size building(s)" + strata,
+        parcel,
     ], "; ")
     return df.select(expr.alias("evidence")).to_series()
 

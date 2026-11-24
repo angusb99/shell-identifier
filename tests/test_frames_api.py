@@ -16,6 +16,7 @@ from shell_identifier.api import frame_datasets, load_frames
 from shell_identifier.assets import load_label_table
 from shell_identifier.dwellings import EMSettings
 from shell_identifier.dwellings.evaluate import evaluate_dwellings
+from shell_identifier.dwellings.pipeline import evidence
 from shell_identifier.loaders import load_gnaf
 
 FIELDS = ["building_name", "lot_number_prefix", "lot_number", "lot_number_suffix", "flat_type_code",
@@ -81,6 +82,10 @@ def test_verify_frames_end_to_end(frames, synth, tmp_path):
     assert m["shell_precision"] > 0.95 and m["shell_recall"] > 0.95
     assert (tmp_path / "out" / "dwelling_assignments.parquet").exists()
     assert "b_levels" not in res["bundle"]["features"]            # no data for it: left out, not crashed
+    ev = res["assignments"]["evidence"]
+    assert ev.str.contains("in a building with").any() and not ev.str.contains("storey").any()
+    # the fitted features alone (no b_levels) are enough to rebuild the text
+    assert evidence(res["assignments"], res["features"]).equals(ev, check_names=False)
 
     pred = predict_frames(res["bundle"], ds_asset=frames["ds_asset"], cad=frames["cad"], bld=frames["bld"], **QUIET)
     assert (pred["assignments"]["mode"] == "predicted").all()
