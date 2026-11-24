@@ -15,7 +15,9 @@ Outputs (``out_dir``)::
     G-NAF/G-NAF <MONTH> <YEAR>/Authority Code/Authority_Code_*_psv.psv
     Cadastre/NSW_CADASTRE.gpkg            layer: cadastre
     Buildings/NSW_BUILDINGS.gpkg          layers: buildings, building_address, building_cadastre
-    truth/shell_truth.csv                 ground truth per ADDRESS_DETAIL_PID
+    truth/shell_truth.csv                 ground truth per ADDRESS_DETAIL_PID (is_shell, is_dwelling, role)
+    truth/pd_labels.csv                   noisy PD / OOS labels: right count per parcel, sometimes on
+                                          the wrong address (e.g. the shell instead of a unit)
     text/addresses_free_text.csv          the same addresses as messy free text
 """
 
@@ -53,6 +55,10 @@ NS_NAMES = ["CHARLES", "VICTORIA", "GEORGE", "ELIZABETH", "WILLIAM", "MACQUARIE"
 LOCALITIES = [("TESTWOOD", "2999"), ("SAMPLE HILL", "2998"), ("MOCKTON PARK", "2997")]
 VANITY = ["THE ARCADIA", "THE MERIDIAN", "PARKSIDE", "THE ASCOT", "HARBOUR VIEW", "THE ELMS"]
 TOWER_VANITY = ["THE ASH", "THE BIRCH", "THE CEDAR"]
+
+# Roles that are private dwellings (everything else is out of scope: shells, shops, suites,
+# car spaces, vacant land, second frontages and aliases).
+PD_ROLES = {"house", "house_with_secondary", "secondary_dwelling", "dwelling", "unit", "unit_slipped", "villa"}
 
 # name: (weight, (min width, max width), street numbers consumed)
 SCENARIOS: dict[str, tuple[float, tuple[float, float], int]] = {
@@ -133,12 +139,13 @@ class Site:
 
 class Builder:
     def __init__(self, seed: int = 42, p_slip: float = 0.02, p_missing_building: float = 0.03,
-                 p_merged_footprint: float = 0.3, p_stacked_suffix: float = 0.2):
+                 p_merged_footprint: float = 0.3, p_stacked_suffix: float = 0.2, p_label_swap: float = 0.3):
         self.rng = np.random.default_rng(seed)
         self.p_slip = p_slip
         self.p_missing_building = p_missing_building
         self.p_merged_footprint = p_merged_footprint   # attached dwellings captured as one footprint
         self.p_stacked_suffix = p_stacked_suffix       # every suffix address geocoded at the property centroid
+        self.p_label_swap = p_label_swap               # sites whose PD label sits on the wrong address
         self.addresses: list[dict] = []
         self.buildings: list[dict] = []
         self.parcels: list[dict] = []
@@ -700,7 +707,9 @@ class Builder:
 
         truth = addr[["pid", "is_shell", "role", "scenario", "site"]].rename(columns={"pid": "address_detail_pid"})
         truth["is_shell"] = truth["is_shell"].astype(int)
+        truth["is_dwelling"] = addr["role"].isin(PD_ROLES).astype(int)
         truth.to_csv(out_dir / "truth" / "shell_truth.csv", index=False)
+        self._noisy_labels(addr).to_csv(out_dir / "truth" / "pd_labels.csv", index=False)
         self._write_text(addr, all_addr, out_dir / "text" / "addresses_free_text.csv")
         return {
             "addresses": int(len(addr)), "shells": int(addr["is_shell"].sum()),
@@ -932,6 +941,30 @@ class Builder:
             "relationship_confidence": 90,
         })
         pyogrio.write_dataframe(bc, path, layer="building_cadastre", driver="GPKG", append=False)
+
+    def _noisy_labels(self, addr: pd.DataFrame) -> pd.DataFrame:
+        """PD / OOS labels with the right count per site but some PDs on the wrong address.
+
+        Mimics a labeller who knows how many dwellings a property has but picks the
+        wrong address for one of them: usually the shell (``20 X ST`` instead of
+        ``UNIT 5, 20 X ST``), otherwise another non-dwelling on the site.
+        """
+        rng = self.rng
+        is_pd = addr["role"].isin(PD_ROLES).to_numpy()
+        label = is_pd.copy()
+        eligible = (~addr["role"].str.endswith("_slipped") & (addr["scenario"] != "split_precinct")).to_numpy()
+        for _, idx in addr.groupby("site").indices.items():
+            idx = idx[eligible[idx]]
+            for _ in range(2 if rng.random() < 0.25 else 1):
+                pos = idx[label[idx] & is_pd[idx]]
+                neg = idx[~label[idx] & ~is_pd[idx]]
+                if len(pos) == 0 or len(neg) == 0 or rng.random() >= self.p_label_swap:
+                    break
+                shells = neg[addr["is_shell"].to_numpy()[neg]]
+                target = rng.choice(shells) if len(shells) and rng.random() < 0.7 else rng.choice(neg)
+                label[rng.choice(pos)] = False
+                label[target] = True
+        return pd.DataFrame({"address_detail_pid": addr["pid"], "label": np.where(label, "PD", "OOS")})
 
     def _write_text(self, addr: pd.DataFrame, all_addr: pd.DataFrame, path: Path) -> None:
         """Free-text rendering of each active address in a mix of real-world styles."""

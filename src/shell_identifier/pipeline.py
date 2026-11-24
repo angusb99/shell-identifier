@@ -37,6 +37,24 @@ def run_pipeline(
     Returns ``{"addresses": GeoDataFrame, "parcels": DataFrame}`` where the
     address frame carries every feature column as well as the scores.
     """
+    ctx = prepare_context(addresses, parcels, buildings, building_address, building_cadastre, cfg)
+    return {"addresses": ctx["scored"], "parcels": summarise_parcels(ctx["scored"], ctx["parcel_ctx"])}
+
+
+def prepare_context(
+    addresses: gpd.GeoDataFrame,
+    parcels: gpd.GeoDataFrame,
+    buildings: gpd.GeoDataFrame | None = None,
+    building_address: pd.DataFrame | None = None,
+    building_cadastre: pd.DataFrame | None = None,
+    cfg: dict | None = None,
+) -> dict:
+    """Spatial assignment, context features and shell scores, plus the metric layers they used.
+
+    Returns ``scored`` (GeoDataFrame in the input CRS), ``parcels_m`` and
+    ``buildings_m`` (metric CRS, buildings carry ``parcel_pid``), ``parcel_ctx``
+    and ``crs_m``.
+    """
     cfg = cfg or load_config()
     scfg = cfg["spatial"]
     crs_m = metric_crs(addresses.crs, scfg.get("metric_crs", "auto"))
@@ -70,7 +88,7 @@ def run_pipeline(
     feats["parent_label"] = feats["parent_pid"].map(labels).fillna("")
     scored = score(feats, cfg)
     scored = gpd.GeoDataFrame(scored, geometry=addr.geometry.to_numpy(), crs=addresses.crs)
-    return {"addresses": scored, "parcels": summarise_parcels(scored, pctx)}
+    return {"scored": scored, "parcels_m": parcels_m, "buildings_m": buildings_m, "parcel_ctx": pctx, "crs_m": crs_m}
 
 
 def summarise_parcels(scored: pd.DataFrame, pctx: pd.DataFrame) -> pd.DataFrame:
