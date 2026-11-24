@@ -79,6 +79,13 @@ def verify(ctx: dict, labels: pl.DataFrame, settings: EMSettings | None = None,
         raise ValueError("no labelled address could be matched to a parcel; check the address id column")
     log(f"{int(train.sum()):,} addresses on {k.height:,} labelled parcels; {int((s['y'] == 1).sum()):,} PD labels")
 
+    # Features with no value on any labelled address (e.g. storeys without floor area or roof height,
+    # strata counts without strata parcels) carry no information and break histogram binning.
+    has_data = F.filter(pl.Series(train)).select(pl.all().is_not_null().any()).row(0, named=True)
+    empty = [k for k, ok in has_data.items() if not ok]
+    if empty:
+        log(f"{len(empty)} features have no data and are left out: {', '.join(empty)}")
+    F_all, F = F, F.select([k for k, ok in has_data.items() if ok])
     X = F.to_numpy()
     parcel = s["parcel_pid"].to_numpy()
     y = s["y"].to_numpy()
@@ -93,7 +100,7 @@ def verify(ctx: dict, labels: pl.DataFrame, settings: EMSettings | None = None,
         mode=pl.Series(np.where(train, "verified", "predicted")),
         k_parcel=lookup(c("parcel_pid"), k["parcel_pid"], k["k"].cast(pl.Float64)),
     )
-    result = _finish(s, F)
+    result = _finish(s, F_all)
     result.update(em=em, features=F, crs=ctx.get("crs"), bundle={
         "model": em.model, "features": F.columns,
         "misplacement_prior": np.exp(em.log_prior_m).round(4).tolist(),

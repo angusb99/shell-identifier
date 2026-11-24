@@ -51,6 +51,7 @@ class TableSource:
     geometry_column: str | None = None   # GDAL geometry (read separately) or detected WKB/WKT column
     crs: str | None = None
     description: str = ""
+    frame: pl.LazyFrame | None = None    # kind == "frame": an in-memory LazyFrame / DataFrame
 
     def find(self, name: str | None) -> str | None:
         """Actual column name matching ``name`` case-insensitively."""
@@ -67,9 +68,9 @@ class TableSource:
         ``where`` is an optional SQL predicate applied before anything else.
         Returns ``(frame, geometries or None, crs)``.
         """
-        gcol = self.geometry_column if geometry == "auto" else (self.find(geometry) if geometry else None)
-        if geometry == "auto" and self.kind != "gdal" and gcol is None:
-            gcol = next((self.find(g) for g in GEOMETRY_CANDIDATES if self.find(g)), None)
+        gcol = None
+        if geometry and self.kind != "gdal":
+            gcol = (self.find(geometry) if geometry != "auto" else None) or self.detect_geometry()
         if self.kind == "gdal":
             return self._read_gdal(columns, read_geometry=geometry is not None, where=where, bbox=bbox,
                                    bbox_crs=bbox_crs)
@@ -90,7 +91,31 @@ class TableSource:
             df, geom = df.filter(pl.Series(keep)), geom[keep]
         return df, geom, self.crs
 
+    def detect_geometry(self) -> str | None:
+        """The geometry column: GDAL / GeoParquet metadata, a usual name, a name containing
+        wkt / geom / shape, or else the first text column whose values look like WKT / hex WKB."""
+        if self.geometry_column:
+            return self.geometry_column
+        named = next((self.find(g) for g in GEOMETRY_CANDIDATES if self.find(g)), None)
+        if named:
+            return named
+        hinted = [col for col in self.columns if any(h in col.lower() for h in ("wkt", "geom", "shape", "wkb"))]
+        if hinted:
+            return hinted[0]
+        schema = self._scan().collect_schema()
+        text = [col for col, dt in schema.items() if dt in (pl.Utf8, pl.Binary)]
+        if not text:
+            return None
+        sample = self._scan().select(text).head(20).collect()
+        for col in text:
+            vals = sample[col].drop_nulls()
+            if vals.len() and vals.dtype == pl.Utf8 and vals.str.contains(_WKT_RX).all():
+                return col
+        return None
+
     def _scan(self) -> pl.LazyFrame:
+        if self.kind == "frame":
+            return self.frame
         if self.kind == "parquet":
             return pl.scan_parquet(self.source)
         if self.kind == "ipc":
@@ -119,6 +144,21 @@ class TableSource:
             df = df.drop(gname)
         crs = crs_string(meta.get("crs")) if meta.get("crs") else self.crs
         return df, geom, crs
+
+
+_WKT_RX = r"(?i)^\s*(SRID=\d+;\s*)?(MULTI)?(POINT|POLYGON|LINESTRING|GEOMETRYCOLLECTION)\b|^0[01]0[1-7]0000"
+
+
+def is_frame(obj) -> bool:
+    return isinstance(obj, (pl.LazyFrame, pl.DataFrame))
+
+
+def frame_source(frame: pl.LazyFrame | pl.DataFrame, name: str = "frame") -> TableSource:
+    """Wrap a polars LazyFrame / DataFrame so it reads like any other table."""
+    lf = frame.lazy() if isinstance(frame, pl.DataFrame) else frame
+    ts = TableSource("frame", name, frame=lf, description=f"polars {type(frame).__name__} {name}")
+    ts.columns = lf.collect_schema().names()
+    return ts
 
 
 def _geoparquet_crs(path: str) -> tuple[str | None, str | None]:
@@ -181,8 +221,10 @@ def _from_file(src: str, layer: str | None) -> TableSource:
     raise ValueError(f"don't know how to read {src} (extension {ext!r})")
 
 
-def open_table(path: str | Path, table: str | None = None) -> TableSource:
-    """Resolve ``path`` (+ ``table``) to a readable :class:`TableSource`."""
+def open_table(path, table: str | None = None) -> TableSource:
+    """Resolve ``path`` (+ ``table``) to a readable :class:`TableSource`; ``path`` may be a polars frame."""
+    if is_frame(path):
+        return frame_source(path, table or "frame")
     src = str(path)
     if _is_remote_or_glob(src):
         return _from_file(src, table)

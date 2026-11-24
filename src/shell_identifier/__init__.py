@@ -1,7 +1,8 @@
 """Shell addresses and private dwellings on cadastral parcels (G-NAF, Geoscape Cadastre and Buildings)."""
 
 __version__ = "0.1.0"
-__all__ = ["datasets_config", "load_config", "load_inputs", "parse_address", "prepare_context", "run_pipeline"]
+__all__ = ["check_frames", "datasets_config", "load_config", "load_frames", "load_inputs", "parse_address",
+           "predict_frames", "prepare_context", "run_pipeline", "score_frames", "verify_frames"]
 
 _LAZY = {
     "load_config": ".config",
@@ -10,6 +11,11 @@ _LAZY = {
     "prepare_context": ".pipeline",
     "datasets_config": ".assets",
     "load_inputs": ".assets",
+    "verify_frames": ".api",
+    "predict_frames": ".api",
+    "score_frames": ".api",
+    "check_frames": ".api",
+    "load_frames": ".api",
 }
 
 

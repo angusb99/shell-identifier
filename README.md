@@ -17,7 +17,7 @@ There are two approaches:
 - **Shell scoring** (`shell-identifier run`): an expert-weighted model that needs no labels.
 - **Dwelling model** (`shell-identifier dwellings …`): learns from PD / out-of-scope labels whose per-parcel count is right but whose choice of address may be wrong. It decides which addresses are the dwellings, moves misplaced labels, and names the primary shell. See [Dwelling model from labelled data](#dwelling-model-from-labelled-data).
 
-It uses three data products: **G-NAF**, **Geoscape Cadastre** and **Geoscape Buildings**, plus the PD labels for the dwelling model. Each input is found by a path and a table name in a small YAML file, so it can be a parquet, CSV, GeoPackage, FileGDB or a folder of tables (see [Your datasets](#your-datasets)). All processing up to the model is done in **polars**, with vectorised shapely for the spatial joins. It can also read free-text address strings with a rule-based parser. There is no LLM and no libpostal. The scoring is a transparent log-odds model: every probability breaks down into named reasons, such as `12 nested sub-address(es) (12 dwelling) [+5.6]; G-NAF primary with 12 linked secondaries [+2.0]`.
+It uses three data products: **G-NAF**, **Geoscape Cadastre** and **Geoscape Buildings**, plus the PD labels for the dwelling model. The inputs can be passed as polars LazyFrames (see [From polars LazyFrames](#from-polars-lazyframes)), or located by path and table name in a small YAML file (see [Your datasets](#your-datasets)). All processing up to the model is done in **polars**, with vectorised shapely for the spatial joins. It can also read free-text address strings with a rule-based parser. There is no LLM and no libpostal. The scoring is a transparent log-odds model: every probability breaks down into named reasons, such as `12 nested sub-address(es) (12 dwelling) [+5.6]; G-NAF primary with 12 linked secondaries [+2.0]`.
 
 ## Quick start
 
@@ -61,6 +61,38 @@ shell-identifier parse "UNIT 1205, LEVEL 12, TOWER B, THE QUAY, 1-15 SMITH STREE
 ```
 
 Run the tests with `.venv/Scripts/python -m pytest`.
+
+## From polars LazyFrames
+
+The most direct way in: read the four inputs yourself and pass the frames. Only the columns that are needed are collected.
+
+```python
+import polars as pl
+from shell_identifier import verify_frames, check_frames
+
+frames = dict(
+    labelled_asset=pl.scan_parquet("D:/data/pd_labels.parquet"),   # ADDRESS_ID, PD_FLAG
+    ds_asset=pl.scan_parquet("D:/data/addresses.parquet"),         # ADDRESS_ID, G-NAF fields, LATITUDE, LONGITUDE
+    cad=pl.scan_csv("D:/data/cadastre_base.csv"),                  # cadastre_polygon_pid, parcel_id, WKT
+    bld=pl.scan_csv("D:/data/buildings.csv"),                      # building_pid, WKT
+)
+print(check_frames(**frames))        # which column feeds which field, and what's missing
+result = verify_frames(**frames, out_dir="results/dwellings")
+result["assignments"]                # per address: dwelling / primary shell / sub-shell / out of scope
+result["moves"]                      # PD labels moved to another address (the review list)
+```
+
+Defaults for this layout:
+- **Keys:** `ADDRESS_ID` is the address key in both the labels and `ds_asset`.
+- **Labels:** `PD_FLAG` values `PD/Y/YES/1/TRUE` mean dwelling, and `OOS/N/NO/0/FALSE` mean out of scope. A boolean or 0/1 column works too.
+- **Address fields:** G-NAF names are found case-insensitively (`FLAT_TYPE_CODE` or `FLAT_TYPE`, `NUMBER_FIRST`, `STREET_NAME`, `STATE_ABBREVIATION`, …), as are `LATITUDE`/`LONGITUDE` (or `LAT`/`LON`/`LONG`).
+- **Parcels:** `parcel_id` is the parcel key, and polygons that share it are parts of one parcel. `cadastre_polygon_pid` is used where `parcel_id` is empty, and every polygon is treated as a base parcel.
+- **Geometry:** WKT columns are found by name (`WKT`, `GEOM_WKT`, `SHAPE`, …) or by their content. EWKT (`SRID=…;`) and WKB also work.
+- **CRS:** `EPSG:7844` (GDA2020 lon/lat) is the default. Pass `crs="EPSG:4283"` for GDA94, or `crs={"cad": "EPSG:7856"}` for projected WKT. Lon/lat swapped, or projected coordinates labelled as lon/lat, stop the run with an explanation.
+
+Override any name with `columns={"ds_asset": {"latitude": "Y"}, "cad": {"geometry": "GEOM_TEXT"}}`, and the label values with `pd_values=` / `oos_values=`. Optional inputs are `counts=` (a frame of `parcel_id, n_dwellings` with trusted counts), and the `bld_address=` / `bld_cadastre=` link tables. Any extra columns the pipeline knows are used when present, such as `LEGAL_PARCEL_ID`, `PRIMARY_SECONDARY`, `GEOCODE_TYPE_CODE`, building `total_floor_area` / `roof_height` / `building_use`, and cadastre strata counts. Features with no data are left out of the model and listed in the log.
+
+`predict_frames(result["bundle"], ds_asset=..., cad=..., bld=...)` applies the fitted model to unlabelled areas, and `score_frames(...)` runs the label-free shell scorer. The same files can be named on the command line instead, for example `--labelled-asset pd_labels.parquet --ds-asset addresses.parquet --cad cadastre_base.csv --bld buildings.csv`.
 
 ## Your datasets
 

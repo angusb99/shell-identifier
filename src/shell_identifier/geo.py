@@ -66,6 +66,7 @@ def decode_geometry(values: pl.Series) -> np.ndarray:
     sample = text.drop_nulls().head(50).to_list()
     if sample and all(s[:2] in ("00", "01") and all(ch in "0123456789abcdefABCDEF" for ch in s[:40]) for s in sample):
         return shapely.from_wkb(text.to_numpy(), on_invalid="warn")
+    text = text.str.replace(r"^\s*SRID=\d+;\s*", "")      # EWKT prefix (PostGIS / Oracle exports)
     return shapely.from_wkt(text.to_numpy(), on_invalid="warn")
 
 

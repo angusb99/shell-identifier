@@ -109,7 +109,8 @@ cad:
   filter: null
   use_base_parcels: true
   columns:
-    parcel_pid: cadastre_pid
+    parcel_pid: cadastre_pid          # the parcel key; parcel_id (lot/plan) works too
+    polygon_pid: cadastre_polygon_pid # used where the parcel key is empty
     geometry: geometry
     parcel_type: parcel_type
     base_parcel: base_parcel

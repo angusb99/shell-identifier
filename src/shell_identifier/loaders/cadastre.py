@@ -27,32 +27,45 @@ CADASTRE_ALIASES = {
 STRATA_COUNT_COLS = ["total_strata_count", "horizontal_strata_count", "vertical_strata_count"]
 
 
-def _upper(df: pl.DataFrame, col: str) -> pl.Expr:
+def _upper(df: pl.DataFrame, col: str) -> pl.Series:
+    """Upper-cased text column ('' for every row when the column is absent)."""
     if col not in df.columns:
-        return pl.lit("")
-    return c(col).cast(pl.Utf8).fill_null("").str.strip_chars().str.to_uppercase()
+        return pl.Series(col, [""] * df.height, dtype=pl.Utf8)
+    return df.get_column(col).cast(pl.Utf8).fill_null("").str.strip_chars().str.to_uppercase()
+
+
+def _nonempty(col: str) -> pl.Expr:
+    v = c(col).cast(pl.Utf8).str.strip_chars()
+    return pl.when(v != "").then(v)
 
 
 def prepare_cadastre(raw: Layer, use_base_parcels: bool = True) -> tuple[Layer, Layer]:
     """Split a cadastre layer (lower-case Geoscape names) into ``(base_parcels, strata_parcels)``.
 
-    ``base_parcels`` gains ``parcel_pid`` (= ``cadastre_pid``) and Float64 strata
-    counts; where the count attributes are empty they are derived by counting strata
-    polygons whose representative point falls in the base parcel.
+    The parcel key ``parcel_pid`` is taken as given (``cadastre_pid``, or ``parcel_id``
+    for a lot/plan key), falling back to ``polygon_pid`` (``cadastre_polygon_pid``) where
+    it is empty; polygons sharing a key are parts of one parcel. Without ``base_parcel`` /
+    ``parcel_type`` every polygon is treated as a base parcel. Strata counts are Float64;
+    where empty they are derived by counting strata polygons inside each base parcel.
     """
     df = raw.df
-    if "parcel_pid" not in df.columns:
-        if "cadastre_pid" not in df.columns:
-            raise KeyError(f"cadastre has no cadastre_pid / CAD_PID / parcel_pid column; columns are {df.columns}")
-        df = df.with_columns(parcel_pid=c("cadastre_pid").cast(pl.Utf8))
-    ptype = df.select(_upper(df, "parcel_type")).to_series()
-    base_flag = df.select(_upper(df, "base_parcel")).to_series()
+    if "parcel_pid" not in df.columns and "cadastre_pid" in df.columns:
+        df = df.with_columns(parcel_pid=c("cadastre_pid"))
+    keys = [_nonempty(k) for k in ("parcel_pid", "polygon_pid") if k in df.columns]
+    if not keys:
+        raise KeyError(f"cadastre has no parcel id (cadastre_pid / parcel_id / cadastre_polygon_pid); "
+                       f"columns are {df.columns}")
+    df = df.with_columns(parcel_pid=pl.coalesce(keys))
+    if df["parcel_pid"].null_count():
+        raise ValueError(f"cadastre: {df['parcel_pid'].null_count():,} polygons have no parcel id")
+    ptype = _upper(df, "parcel_type")
+    base_flag = _upper(df, "base_parcel")
     if use_base_parcels and (base_flag == "YES").any():
         is_base = (base_flag == "YES").to_numpy()
     elif (ptype == "LOT").any():
         is_base = (ptype == "LOT").to_numpy()
-    else:
-        is_base = (ptype != "ROAD").to_numpy() if (ptype == "ROAD").any() else ptype.is_not_null().to_numpy()
+    else:   # a base-parcel extract without type columns: everything except roads
+        is_base = (ptype != "ROAD").to_numpy()
     is_strata = ptype.is_in(["STRATA", "STRATUM"]).to_numpy()
 
     df = df.with_columns(parcel_pid=c("parcel_pid").cast(pl.Utf8),
@@ -65,7 +78,7 @@ def prepare_cadastre(raw: Layer, use_base_parcels: bool = True) -> tuple[Layer, 
     if len(strata) and no_counts.any():
         rp = shapely.point_on_surface(strata.geom)
         i, j = points_within(shapely.get_x(rp), shapely.get_y(rp), base.geom)
-        stype = strata.df.select(_upper(strata.df, "strata_type")).to_series()
+        stype = _upper(strata.df, "strata_type")
         hits = pl.DataFrame({"parcel_pid": base.df["parcel_pid"].gather(j), "_t": stype.gather(i)})
         derived = hits.group_by("parcel_pid").agg(
             pl.len().cast(pl.Float64).alias("_tot"),

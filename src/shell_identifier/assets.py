@@ -29,7 +29,7 @@ from .frames import c
 from .geo import Layer, crs_string
 from .loaders import (canonical_links, is_gnaf_release, load_gnaf, open_table, parse_column, prepare_buildings,
                       prepare_cadastre)
-from .loaders._io import TableSource
+from .loaders._io import TableSource, is_frame
 from .loaders.buildings import BUILDING_ALIASES
 from .loaders.cadastre import CADASTRE_ALIASES
 from .dwellings.labels import labels_from_frame
@@ -65,7 +65,8 @@ ALIASES: dict[str, list[str]] = {
     "latitude": ["latitude", "lat"],
     "address_text": ["address_text", "full_address", "address_string", "address_label", "address"],
     "label": ["label", "pd_label", "dwelling_label", "pd_flag", "is_pd", "dwelling_type"],
-    "parcel_pid": ["cadastre_pid", "cad_pid", "parcel_pid"],
+    "parcel_pid": ["cadastre_pid", "cad_pid", "parcel_pid", "parcel_id"],
+    "polygon_pid": ["cadastre_polygon_pid", "polygon_pid", "cd_ply_pid"],
     "building_pid": ["building_pid", "bld_pid"],
     "n_dwellings": ["n_dwellings", "dwellings", "dwelling_count", "k"],
 }
@@ -73,6 +74,10 @@ for _short, _long in {**CADASTRE_ALIASES, **BUILDING_ALIASES}.items():
     ALIASES.setdefault(_long, [_long]).append(_short.lower())
 
 ADDRESS_COMPONENTS = ["number_first", "street_name"]
+# Columns a dataset cannot do without (longitude / latitude may be a point geometry instead).
+REQUIRED = {"labelled_asset": {"address_pid", "label"}, "ds_asset": {"address_pid"},
+            "bld": {"building_pid"}, "cad": {"parcel_pid"}, "bld_address": {"address_pid", "building_pid"},
+            "bld_cadastre": {"building_pid", "cadastre_pid"}}
 # Columns that are looked for under their usual names even when the YAML leaves them null.
 AUTO_DETECT = {"ps_primary_pid", "address_text"}
 GEOMETRY_ROLES = {"bld", "cad"}
@@ -86,11 +91,25 @@ def template_text() -> str:
     return resources.files("shell_identifier").joinpath("default_datasets.yaml").read_text(encoding="utf-8")
 
 
+def _copy(v):
+    return v if is_frame(v) else copy.deepcopy(v)
+
+
 def _merge(base: dict, over: dict) -> dict:
-    out = copy.deepcopy(base)
+    out = {k: _copy(v) for k, v in base.items()}
     for k, v in (over or {}).items():
-        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else copy.deepcopy(v)
+        out[k] = _merge(out[k], v) if isinstance(v, dict) and isinstance(out.get(k), dict) else _copy(v)
     return out
+
+
+def has_path(spec: dict | None) -> bool:
+    """A dataset is given: a non-empty path or a polars frame."""
+    p = (spec or {}).get("path")
+    return is_frame(p) or bool(p)
+
+
+def _relative(v) -> bool:
+    return isinstance(v, (str, Path)) and bool(str(v)) and "://" not in str(v) and not Path(str(v)).is_absolute()
 
 
 def datasets_config(path: str | Path | None = None, overrides: dict | None = None) -> dict:
@@ -106,14 +125,13 @@ def datasets_config(path: str | Path | None = None, overrides: dict | None = Non
             cfg = _merge(cfg, yaml.safe_load(fh) or {})
         base_dir = Path(path).resolve().parent
     # paths given as overrides (command line, Python) are relative to the working directory
-    overrides = copy.deepcopy(overrides or {})
+    overrides = _merge({}, overrides or {})
     for spec in overrides.values():
         if not isinstance(spec, dict):
             continue
         for key in ("path", "height_table", "localities"):
-            v = spec.get(key)
-            if v and "://" not in str(v) and not Path(str(v)).is_absolute():
-                spec[key] = str(Path.cwd() / str(v))
+            if _relative(spec.get(key)):
+                spec[key] = str(Path.cwd() / str(spec[key]))
     cfg = _merge(cfg, overrides)
     root = Path(cfg["root"]) if cfg.get("root") else None
     if root is not None and not root.is_absolute():
@@ -121,15 +139,13 @@ def datasets_config(path: str | Path | None = None, overrides: dict | None = Non
     for role in ROLES:
         spec = cfg.setdefault(role, {})
         spec.setdefault("columns", {})
-        p = spec.get("path")
-        if p and "://" not in str(p) and not Path(str(p)).is_absolute():
-            spec["path"] = str((root or base_dir) / str(p))
-        elif not p and root is not None and role in ("labelled_asset", "ds_asset", "bld", "cad"):
+        if _relative(spec.get("path")):
+            spec["path"] = str((root or base_dir) / str(spec["path"]))
+        elif not has_path(spec) and root is not None and role in ("labelled_asset", "ds_asset", "bld", "cad"):
             spec["path"] = str(root)
         for key in ("height_table", "localities"):
-            v = spec.get(key)
-            if v and not Path(str(v)).is_absolute():
-                spec[key] = str((root or base_dir) / str(v))
+            if _relative(spec.get(key)):
+                spec[key] = str((root or base_dir) / str(spec[key]))
     return cfg
 
 
@@ -226,7 +242,7 @@ def load_addresses(spec: dict, bbox=None, log: Callable = print) -> Layer:
     """``ds_asset`` -> canonical point layer (``x`` / ``y`` in its CRS)."""
     fmt = str(spec.get("format") or "auto").lower()
     path = spec.get("path")
-    if fmt == "gnaf" or (fmt == "auto" and path and is_gnaf_release(path)):
+    if fmt == "gnaf" or (fmt == "auto" and not is_frame(path) and path and is_gnaf_release(path)):
         layer = load_gnaf(path, states=spec.get("states"), crs=spec.get("crs") if spec.get("crs") not in
                           (None, "auto") else "EPSG:7844")
         log(f"ds_asset: G-NAF release {path}: {len(layer):,} active addresses")
@@ -274,6 +290,7 @@ def load_addresses(spec: dict, bbox=None, log: Callable = print) -> Layer:
         crs = crs or "EPSG:7844"
         layer = Layer(df, None, crs_string(crs))
         log(f"ds_asset: {r.source.description}: {len(layer):,} addresses")
+    check_coordinates(layer, "ds_asset")
     missing = layer.df.filter(c("x").is_null() | c("y").is_null()).height
     if missing:
         log(f"ds_asset: dropped {missing:,} addresses without coordinates")
@@ -286,13 +303,14 @@ def load_addresses(spec: dict, bbox=None, log: Callable = print) -> Layer:
 def load_parcels(spec: dict, bbox=None, log: Callable = print) -> tuple[Layer, Layer]:
     """``cad`` -> (base parcels, strata parcels)."""
     r = resolve("cad", spec)
-    if "parcel_pid" not in r.mapping:
-        raise KeyError(f"cad: no parcel id column (columns.parcel_pid) in {r.source.description}; "
-                       f"columns are {r.source.columns}")
+    if not {"parcel_pid", "polygon_pid"} & set(r.mapping):
+        raise KeyError(f"cad: no parcel id column (columns.parcel_pid, e.g. cadastre_pid or parcel_id) in "
+                       f"{r.source.description}; columns are {r.source.columns}")
     df, geom, crs = _read(r, bbox)
     if geom is None:
         raise KeyError(f"cad: no geometry column found in {r.source.description} (set columns.geometry)")
-    base, strata = prepare_cadastre(Layer(df, geom, crs), bool(spec.get("use_base_parcels", True)))
+    layer = check_coordinates(Layer(df, geom, _default_crs(crs, "cad", log)), "cad")
+    base, strata = prepare_cadastre(layer, bool(spec.get("use_base_parcels", True)))
     log(f"cad: {r.source.description}: {len(base):,} base parcel polygons, {len(strata):,} strata polygons")
     return base, strata
 
@@ -310,8 +328,41 @@ def load_building_layer(spec: dict, storey_height_m: float = 3.1, bbox=None, log
     if spec.get("height_table"):
         heights = open_table(spec["height_table"]).read(geometry=None)[0]
         heights = heights.rename({k: k.lower() for k in heights.columns})
-    layer = prepare_buildings(Layer(df, geom, crs), storey_height_m, heights)
+    layer = check_coordinates(Layer(df, geom, _default_crs(crs, "bld", log)), "bld")
+    layer = prepare_buildings(layer, storey_height_m, heights)
     log(f"bld: {r.source.description}: {len(layer):,} footprints")
+    return layer
+
+
+def _default_crs(crs, role: str, log: Callable) -> str:
+    if crs:
+        return crs
+    log(f"{role}: no CRS in the source; assuming EPSG:7844 (GDA2020 lon/lat) - set crs: if that is wrong")
+    return "EPSG:7844"
+
+
+def check_coordinates(layer: Layer, role: str) -> Layer:
+    """Fail early on projected coordinates labelled as lon/lat, or latitude and longitude swapped."""
+    from pyproj import CRS
+
+    if not len(layer) or not layer.crs or not CRS.from_user_input(layer.crs).is_geographic:
+        return layer
+    if layer.geom is None:
+        x, y = layer.xy()
+        x, y = x[np.isfinite(x)], y[np.isfinite(y)]
+        if not len(x):
+            return layer
+        x0, y0, x1, y1 = x.min(), y.min(), x.max(), y.max()
+    else:
+        x0, y0, x1, y1 = shapely.total_bounds(layer.geom)
+    if -60 <= y0 and y1 <= 0 and 90 <= x0 and x1 <= 180:
+        return layer                                   # Australia, the right way round
+    if -60 <= x0 and x1 <= 0 and 90 <= y0 and y1 <= 180:
+        raise ValueError(f"{role}: x runs {x0:.1f}..{x1:.1f} and y {y0:.1f}..{y1:.1f}: latitude and longitude "
+                         f"look swapped (map longitude -> columns.longitude, latitude -> columns.latitude)")
+    if max(abs(x0), abs(x1)) > 180 or max(abs(y0), abs(y1)) > 90:
+        raise ValueError(f"{role}: coordinates run {x0:.0f}..{x1:.0f}, {y0:.0f}..{y1:.0f}, which is not lon/lat "
+                         f"in {layer.crs}; set the dataset's crs (e.g. EPSG:7856 for MGA zone 56)")
     return layer
 
 
@@ -344,7 +395,7 @@ def load_label_table(spec: dict, log: Callable = print) -> pl.DataFrame:
 
 
 def _gpkg_layers(path) -> list[str]:
-    if not path or not str(path).lower().endswith(".gpkg") or not Path(str(path)).exists():
+    if is_frame(path) or not path or not str(path).lower().endswith(".gpkg") or not Path(str(path)).exists():
         return []
     import pyogrio
 
@@ -373,29 +424,29 @@ def load_inputs(datasets: dict, cfg: dict | None = None, labels: bool = False, b
 
     cfg = cfg or load_config()
     for role in ("ds_asset", "cad") + (("labelled_asset",) if labels else ()):
-        if not datasets.get(role, {}).get("path"):
+        if not has_path(datasets.get(role)):
             raise ValueError(f"no path for {role} ({DESCRIPTIONS[role]}); set it in the datasets YAML or with "
                              f"--{role.replace('_', '-')}")
     out = Inputs()
     out.addresses = load_addresses(datasets["ds_asset"], bbox, log)
     out.parcels, out.strata = load_parcels(datasets["cad"], bbox, log)
     bld = datasets.get("bld", {})
-    if bld.get("path"):
+    if has_path(bld):
         out.buildings = load_building_layer(bld, float(cfg["spatial"]["storey_height_m"]), bbox, log)
         layers = {lay.lower() for lay in _gpkg_layers(bld["path"])}
         for role in ("bld_address", "bld_cadastre"):
             spec = datasets.get(role, {})
-            if not spec.get("path") and str(spec.get("table", "")).lower() in layers:
+            if not has_path(spec) and str(spec.get("table", "")).lower() in layers:
                 datasets[role] = {**spec, "path": bld["path"]}
     else:
         log("bld: no buildings given - building features will be empty (the model still runs, less accurately)")
-    if datasets.get("bld_address", {}).get("path"):
+    if has_path(datasets.get("bld_address")):
         out.building_address = canonical_links(load_table("bld_address", datasets["bld_address"], log))
-    if datasets.get("bld_cadastre", {}).get("path"):
+    if has_path(datasets.get("bld_cadastre")):
         out.building_cadastre = canonical_links(load_table("bld_cadastre", datasets["bld_cadastre"], log))
     if labels:
         out.labels = load_label_table(datasets["labelled_asset"], log)
-    if datasets.get("parcel_counts", {}).get("path"):
+    if has_path(datasets.get("parcel_counts")):
         k = load_table("parcel_counts", datasets["parcel_counts"], log)
         if not {"parcel_pid", "n_dwellings"} <= set(k.columns):
             # no recognised names: take the first two columns (parcel id, count)
@@ -427,10 +478,11 @@ def check_datasets(datasets: dict) -> str:
     for role in ROLES:
         spec = datasets.get(role, {})
         title = f"{role} ({DESCRIPTIONS[role]})"
-        if not spec.get("path"):
+        if not has_path(spec):
             lines += [f"{title}: no path set", ""]
             continue
-        if role == "ds_asset" and (str(spec.get("format")).lower() == "gnaf" or is_gnaf_release(spec["path"])):
+        if role == "ds_asset" and not is_frame(spec["path"]) and (
+                str(spec.get("format")).lower() == "gnaf" or is_gnaf_release(spec["path"])):
             lines += [f"{title}: G-NAF PSV release at {spec['path']}", ""]
             continue
         try:
@@ -440,16 +492,20 @@ def check_datasets(datasets: dict) -> str:
             continue
         ts = r.source
         n = _row_count(ts)
-        geom = ts.geometry_column or next((ts.find(g) for g in ("geometry", "geom", "wkb_geometry", "shape", "wkt")
-                                           if ts.find(g)), None)
+        wants_geom = role in GEOMETRY_ROLES or (role == "ds_asset" and not {"longitude", "latitude"} <= set(r.mapping))
+        configured_geom = spec.get("columns", {}).get("geometry")
+        geom = (ts.find(configured_geom) if configured_geom else None) or (ts.detect_geometry() if wants_geom else None)
         lines.append(f"{title}: {ts.description}" + (f", {n:,} rows" if n is not None else ""))
         if role in GEOMETRY_ROLES or role == "ds_asset":
-            crs = spec.get("crs") if spec.get("crs") not in (None, "auto") else (ts.crs or "unknown")
-            lines.append(f"  geometry: {geom or 'none found'}; crs: {crs}")
+            crs = spec.get("crs") if spec.get("crs") not in (None, "auto") else (
+                ts.crs or "not stated, EPSG:7844 assumed")
+            where = geom or ("longitude / latitude" if role == "ds_asset" else "NONE FOUND - set columns.geometry")
+            lines.append(f"  geometry: {where}; crs: {crs}")
         for canon, actual in r.mapping.items():
             lines.append(f"  {canon:<24} <- {actual}")
+        required = REQUIRED.get(role, set())
         for canon in r.missing:
-            lines.append(f"  {canon:<24}    (not found)")
+            lines.append(f"  {canon:<24}    " + ("(NOT FOUND - required)" if canon in required else "(not found, optional)"))
         for note in r.notes:
             lines.append(f"  note: {note}")
         unmapped = [col for col in ts.columns if col not in r.mapping.values() and col != geom]
