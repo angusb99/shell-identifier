@@ -20,7 +20,7 @@ Outputs (``out_dir``)::
                                           the wrong address (e.g. the shell instead of a unit)
     text/addresses_free_text.csv          the same addresses as messy free text
     assets/                               the four pipeline inputs as standalone tables:
-        labelled_asset.parquet            address_detail_pid, label (PD / OOS)
+        labelled_asset.parquet            address_detail_pid, label: the PD-labelled addresses only
         ds_asset.parquet                  flattened G-NAF address view (upper-case names, flat / level /
                                           geocode type *names*, retired rows, PRIMARY_PID)
         bld.parquet                       building footprints (GeoParquet)
@@ -1077,7 +1077,8 @@ def write_assets(out_dir: str | Path, seed: int = 0) -> Path:
         ("GANSWRET" + pl.int_range(pl.len()).cast(pl.Utf8).str.zfill(6)).alias("ADDRESS_DETAIL_PID"),
         pl.lit("2025-06-30").alias("DATE_RETIRED"))
     pl.concat([view, retired]).write_parquet(a_dir / "ds_asset.parquet")
-    pl.read_csv(out_dir / "truth" / "pd_labels.csv").write_parquet(a_dir / "labelled_asset.parquet")
+    (pl.read_csv(out_dir / "truth" / "pd_labels.csv").filter(pl.col("label") == "PD")
+     .write_parquet(a_dir / "labelled_asset.parquet"))
     gpd.read_file(out_dir / "Buildings" / f"{STATE}_BUILDINGS.gpkg", layer="buildings").to_parquet(a_dir / "bld.parquet")
     gpd.read_file(out_dir / "Cadastre" / f"{STATE}_CADASTRE.gpkg", layer="cadastre").to_parquet(a_dir / "cad.parquet")
     (a_dir / "datasets.yaml").write_text(ASSETS_YAML, encoding="utf-8")

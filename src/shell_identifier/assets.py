@@ -32,7 +32,7 @@ from .loaders import (canonical_links, is_gnaf_release, load_gnaf, open_table, p
 from .loaders._io import TableSource, is_frame
 from .loaders.buildings import BUILDING_ALIASES
 from .loaders.cadastre import CADASTRE_ALIASES
-from .dwellings.labels import labels_from_frame
+from .dwellings.labels import labels_from_frame, pd_flag
 
 ROLES = ("labelled_asset", "ds_asset", "bld", "cad", "bld_address", "bld_cadastre", "parcel_counts")
 DESCRIPTIONS = {
@@ -75,7 +75,7 @@ for _short, _long in {**CADASTRE_ALIASES, **BUILDING_ALIASES}.items():
 
 ADDRESS_COMPONENTS = ["number_first", "street_name"]
 # Columns a dataset cannot do without (longitude / latitude may be a point geometry instead).
-REQUIRED = {"labelled_asset": {"address_pid", "label"}, "ds_asset": {"address_pid"},
+REQUIRED = {"labelled_asset": {"address_pid"}, "ds_asset": {"address_pid"},
             "bld": {"building_pid"}, "cad": {"parcel_pid"}, "bld_address": {"address_pid", "building_pid"},
             "bld_cadastre": {"building_pid", "cadastre_pid"}}
 # Columns that are looked for under their usual names even when the YAML leaves them null.
@@ -375,22 +375,32 @@ def load_table(role: str, spec: dict, log: Callable = print) -> pl.DataFrame:
 
 
 def load_label_table(spec: dict, log: Callable = print) -> pl.DataFrame:
-    """``labelled_asset`` -> ``address_pid, y, label_raw``."""
+    """``labelled_asset`` -> the PD addresses (``address_pid, y, label_raw``).
+
+    Rows whose label is a PD value (``pd_values``; default PD / 1 / Y / YES / TRUE) are
+    kept; any other row, and every address not in the table, is taken as not PD. With
+    no label column mapped, every row is a PD.
+    """
     r = resolve("labelled_asset", spec)
-    for canon in ("address_pid", "label"):
-        if canon not in r.mapping:
-            raise KeyError(f"labelled_asset: no {canon} column (columns.{canon}) in {r.source.description}; "
-                           f"columns are {r.source.columns}")
+    if "address_pid" not in r.mapping:
+        raise KeyError(f"labelled_asset: no address_pid column (columns.address_pid) in {r.source.description}; "
+                       f"columns are {r.source.columns}")
     df, _, _ = _read(r)
-    labels = labels_from_frame(df, "address_pid", "label", spec.get("pd_values"), spec.get("oos_values"))
-    counts = labels["y"].value_counts()
-    n = {int(k): int(v) for k, v in counts.iter_rows()}
-    log(f"labelled_asset: {r.source.description}: {labels.height:,} labelled addresses - {n.get(1, 0):,} PD, "
-        f"{n.get(0, 0):,} out of scope, {n.get(-1, 0):,} unrecognised values")
-    if n.get(-1, 0):
-        unknown = labels.filter(c("y") == -1)["label_raw"].value_counts(sort=True).head(8)
-        log(f"labelled_asset: unrecognised label values (treated as unlabelled): "
-            f"{dict(unknown.iter_rows())}; set pd_values / oos_values to map them")
+    label = "label" if "label" in r.mapping else None
+    labels = labels_from_frame(df, "address_pid", label, spec.get("pd_values"))
+    if label is None:
+        log(f"labelled_asset: {r.source.description}: {labels.height:,} PD addresses "
+            f"(no label column, so every row is a PD)")
+        return labels
+    other = df.filter(~pd_flag("label", spec.get("pd_values")))
+    msg = f"labelled_asset: {r.source.description}: {labels.height:,} PD addresses ({r.mapping['label']} true)"
+    if other.height:
+        seen = other["label"].cast(pl.Utf8).fill_null("<null>").value_counts(sort=True).head(6)
+        msg += f"; {other.height:,} rows with other values ignored (not PD): {dict(seen.iter_rows())}"
+    log(msg)
+    if labels.is_empty():
+        raise ValueError(f"labelled_asset: no row has a PD value in {r.mapping['label']}; "
+                         f"set pd_values to the value(s) that mean PD")
     return labels
 
 
@@ -505,7 +515,10 @@ def check_datasets(datasets: dict) -> str:
             lines.append(f"  {canon:<24} <- {actual}")
         required = REQUIRED.get(role, set())
         for canon in r.missing:
-            lines.append(f"  {canon:<24}    " + ("(NOT FOUND - required)" if canon in required else "(not found, optional)"))
+            what = ("(NOT FOUND - required)" if canon in required else
+                    "(not found: every row is a PD)" if (role, canon) == ("labelled_asset", "label") else
+                    "(not found, optional)")
+            lines.append(f"  {canon:<24}    {what}")
         for note in r.notes:
             lines.append(f"  note: {note}")
         unmapped = [col for col in ts.columns if col not in r.mapping.values() and col != geom]

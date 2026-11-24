@@ -53,6 +53,34 @@ def test_conditional_marginals_sum_to_count():
     assert q.sum() == pytest.approx(3.0)
 
 
+def test_usable_columns():
+    from shell_identifier.dwellings.countem import BIN_SAMPLE, usable_columns
+
+    X = np.full((10, 3), np.nan)
+    X[:, 0], X[3, 1] = 1.0, 2.0
+    assert usable_columns(X).tolist() == [True, True, False]
+    w = np.ones(10)
+    w[3] = 0.0                                   # the only value has no weight
+    assert usable_columns(X, w).tolist() == [True, False, False]
+    big = np.full((BIN_SAMPLE + 1, 2), np.nan)
+    big[:, 0], big[:5, 1] = 1.0, 1.0             # 5 values in 200k rows: too sparse to bin reliably
+    assert usable_columns(big).tolist() == [True, False]
+
+
+@pytest.mark.parametrize("seed", [0, 1, 2])
+def test_fit_soft_survives_a_feature_too_sparse_for_the_bin_sample(seed):
+    """scikit-learn bins on a 200k-row sample; a feature absent from it used to crash the fit."""
+    from shell_identifier.dwellings.countem import BIN_SAMPLE, EMSettings, fit_soft
+
+    rng = np.random.default_rng(seed)
+    n = BIN_SAMPLE + 10_000
+    X = np.column_stack([rng.normal(size=n), np.full(n, np.nan), np.full(n, np.inf)])
+    X[0, 1] = 1.0
+    q = (rng.random(n) < 0.3).astype(float)
+    clf = fit_soft(X, q, {**EMSettings().clf_params, "max_iter": 1, "random_state": seed})
+    assert clf.predict_proba(X[:5]).shape == (5, 2)
+
+
 def test_label_on_shell_moves_to_unit():
     # 100 TEST ST (shell-like) labelled PD with UNIT 1; UNIT 2 unlabelled. Two dwellings on the parcel.
     logits = np.array([-3.0, 3.0, 3.0])

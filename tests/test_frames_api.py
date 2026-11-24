@@ -1,6 +1,6 @@
 """The LazyFrame API, with inputs in this layout:
 
-labelled_asset: ADDRESS_ID, PD_FLAG
+labelled_asset: ADDRESS_ID, PD_FLAG (true on every row: the PD addresses; the rest are not PD)
 ds_asset:       ADDRESS_ID, G-NAF address fields, LATITUDE, LONGITUDE
 cad:            cadastre_polygon_pid, parcel_id, WKT polygon (base parcels only)
 bld:            building_pid, WKT polygon
@@ -12,7 +12,8 @@ import pytest
 import shapely
 
 from shell_identifier import check_frames, predict_frames, score_frames, verify_frames
-from shell_identifier.api import load_frames
+from shell_identifier.api import frame_datasets, load_frames
+from shell_identifier.assets import load_label_table
 from shell_identifier.dwellings import EMSettings
 from shell_identifier.dwellings.evaluate import evaluate_dwellings
 from shell_identifier.loaders import load_gnaf
@@ -47,9 +48,8 @@ def frames(synth):
     ds = g.select(pl.col("address_pid").alias("ADDRESS_ID"), *[pl.col(f).alias(f.upper()) for f in FIELDS],
                   pl.col("state").alias("STATE_ABBREVIATION"), pl.col("geocode_type").alias("GEOCODE_TYPE_CODE"),
                   pl.col("y").alias("LATITUDE"), pl.col("x").alias("LONGITUDE"))
-    lab = pl.read_csv(synth / "truth" / "pd_labels.csv").select(
-        pl.col("address_detail_pid").alias("ADDRESS_ID"),
-        pl.when(pl.col("label") == "PD").then(pl.lit("Y")).otherwise(pl.lit("N")).alias("PD_FLAG"))
+    lab = pl.read_csv(synth / "truth" / "pd_labels.csv").filter(pl.col("label") == "PD").select(
+        pl.col("address_detail_pid").alias("ADDRESS_ID"), pl.lit(True).alias("PD_FLAG"))
     cad, wkt = _wkt(synth / "assets" / "cad.parquet")
     cad = (cad.with_columns(geom_wkt=pl.Series(wkt)).filter(pl.col("base_parcel") == "Yes")
            .select("cadastre_polygon_pid", "parcel_id", "geom_wkt"))
@@ -88,11 +88,21 @@ def test_verify_frames_end_to_end(frames, synth, tmp_path):
     assert agree > 0.97
 
 
+def test_label_layouts_agree(frames):
+    """PD rows only, a Y/N flag on every address, and an id column alone give the same PD set."""
+    pd_ids = sorted(frames["labelled_asset"].collect()["ADDRESS_ID"].to_list())
+    yn = frames["ds_asset"].select("ADDRESS_ID", PD_FLAG=pl.when(pl.col("ADDRESS_ID").is_in(pd_ids))
+                                   .then(pl.lit("Y")).otherwise(pl.lit("N")))
+    for lab in (frames["labelled_asset"], yn, frames["labelled_asset"].select("ADDRESS_ID")):
+        spec = frame_datasets(lab)["labelled_asset"]
+        assert sorted(load_label_table(spec, **QUIET)["address_pid"].to_list()) == pd_ids
+
+
 def test_eager_frames_numeric_flags_and_ewkt(frames, synth):
-    lab = frames["labelled_asset"].with_columns((pl.col("PD_FLAG") == "Y").cast(pl.Int8).alias("PD_FLAG")).collect()
+    lab = frames["labelled_asset"].with_columns(pl.lit(1, dtype=pl.Int8).alias("PD_FLAG")).collect()
     cad = frames["cad"].with_columns(("SRID=7844;" + pl.col("geom_wkt")).alias("SHAPE")).drop("geom_wkt").collect()
     inputs = load_frames(lab, frames["ds_asset"].collect(), cad, frames["bld"].collect(), **QUIET)
-    assert inputs.labels["y"].is_in([0, 1]).all()
+    assert inputs.labels.height == lab.height and (inputs.labels["y"] == 1).all()
     assert len(inputs.parcels) == cad.height and inputs.parcels.crs == "EPSG:7844"
     assert inputs.buildings.df["building_area"].min() > 0          # measured from the footprint
 

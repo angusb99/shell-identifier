@@ -206,18 +206,54 @@ class EMSettings:
     random_state: int = 0
 
 
+# With more rows than this, scikit-learn's histogram GBM takes its bin edges from a random
+# sample of this many rows (drawn in proportion to sample weight). A feature with no value
+# in that sample crashes the binning in scikit-learn 1.9 ("window shape cannot be larger
+# than input array shape"), so features that sparse are left out of the fit.
+BIN_SAMPLE = 200_000
+MIN_SAMPLED_VALUES = 30   # expected values of a feature in that sample; P(none drawn) ~ exp(-30)
+
+
+def as_matrix(X) -> np.ndarray:
+    """A float matrix (copied) with nulls and infinities as NaN, i.e. missing."""
+    if isinstance(X, pl.DataFrame):
+        X = X.select(pl.all().cast(pl.Float64)).to_numpy()
+    X = np.array(X, dtype=float)
+    X[~np.isfinite(X)] = np.nan
+    return X
+
+
+def usable_columns(X: np.ndarray, weight: np.ndarray | None = None) -> np.ndarray:
+    """Columns with enough values, on rows of positive weight, for histogram binning."""
+    w = np.ones(len(X)) if weight is None else np.asarray(weight, dtype=float)
+    pos = w > 0
+    total = w[pos].sum()
+    ok = np.zeros(X.shape[1], dtype=bool)
+    for j in range(X.shape[1]):
+        has = pos & ~np.isnan(X[:, j])
+        if has.any():
+            ok[j] = len(X) <= BIN_SAMPLE or w[has].sum() / total * BIN_SAMPLE >= MIN_SAMPLED_VALUES
+    return ok
+
+
 def fit_soft(X: np.ndarray, q: np.ndarray, params: dict, weight: np.ndarray | None = None):
-    """Fit a classifier to soft targets: confident rows once, uncertain rows twice weighted q / 1-q."""
+    """Fit a classifier to soft targets: confident rows once, uncertain rows twice weighted q / 1-q.
+
+    Features without enough data in these rows (:func:`usable_columns`) are held
+    constant for the fit, so no tree splits on them and their values are ignored later.
+    """
     from sklearn.ensemble import HistGradientBoostingClassifier
 
     weight = np.ones(len(q)) if weight is None else weight
     hard = (q <= 0.01) | (q >= 0.99)
     soft = ~hard
-    Xs = np.vstack([X[hard], X[soft], X[soft]])
+    Xs = np.vstack([X[hard], X[soft], X[soft]]).astype(float, copy=False)
     ys = np.concatenate([(q[hard] >= 0.5).astype(int), np.ones(soft.sum(), int), np.zeros(soft.sum(), int)])
     ws = np.concatenate([weight[hard], weight[soft] * q[soft], weight[soft] * (1.0 - q[soft])])
     if len(np.unique(ys)) < 2:  # degenerate: add a weightless counter-example
         Xs, ys, ws = np.vstack([Xs, Xs[:1]]), np.append(ys, 1 - ys[0]), np.append(ws, 1e-6)
+    Xs[~np.isfinite(Xs)] = np.nan
+    Xs[:, ~usable_columns(Xs, ws)] = 0.0
     return HistGradientBoostingClassifier(**params).fit(Xs, ys, sample_weight=ws)
 
 
@@ -232,17 +268,19 @@ class CountConstrainedEM:
         self.history: list[dict] = []
         self.model = None
 
-    def _e_step(self, logits, groups, k, labelled):
-        q = np.empty(len(logits))
+    # ``groups`` / ``k`` cover only the parcels whose answer the count leaves open (0 < k < n);
+    # ``fixed`` holds the rest (all dwellings when k = n, none when k = 0).
+    def _e_step(self, logits, groups, k, labelled, fixed):
+        q = fixed.astype(float)
         post = np.zeros(len(self.prior0))
         for idx, kk in zip(groups, k):
             q[idx], pm = swap_posterior(logits[idx], labelled[idx], int(kk), self.log_prior_m)
-            if 0 < kk < len(idx) and labelled[idx].any() and (~labelled[idx]).any():
+            if labelled[idx].any() and (~labelled[idx]).any():
                 post += pm
         return q, post
 
-    def _map(self, logits, groups, k, labelled):
-        z = np.zeros(len(logits), dtype=bool)
+    def _map(self, logits, groups, k, labelled, fixed):
+        z = fixed.copy()
         for idx, kk in zip(groups, k):
             z[idx] = swap_map(logits[idx], labelled[idx], int(kk), self.log_prior_m)
         return z
@@ -251,8 +289,8 @@ class CountConstrainedEM:
         """Fit on labelled parcels.
 
         ``X`` rows are addresses, ``parcel`` their parcel ids, ``k_parcel`` the
-        dwelling count per parcel id and ``y`` the address labels (1 PD, 0 out of
-        scope, -1 unknown). Sets ``oof_prob``, ``posterior`` and ``assigned``.
+        dwelling count per parcel id and ``y`` the address labels (1 PD, anything
+        else not). Sets ``oof_prob``, ``posterior`` and ``assigned``.
         """
         from sklearn.model_selection import GroupKFold
 
@@ -264,6 +302,9 @@ class CountConstrainedEM:
         groups = [order[bounds[g]:bounds[g + 1]] for g in range(len(uniques))]
         sizes = np.array([len(g) for g in groups])
         k = np.minimum(np.array([int(k_parcel.get(u, 0)) for u in uniques], dtype=int), sizes)
+        fixed = (k >= sizes)[codes]                      # parcels where every address is a dwelling
+        open_ = np.flatnonzero((k > 0) & (k < sizes))    # the others with k = 0 have none
+        groups, k = [groups[g] for g in open_], k[open_]
 
         # Single-address parcels have a fixed answer: subsample them for training, reweighted.
         rng = np.random.default_rng(self.s.random_state)
@@ -274,8 +315,8 @@ class CountConstrainedEM:
 
         base = float(np.clip(labelled.mean(), 0.01, 0.99))
         logits = np.full(n, _logit(np.array([base]))[0])
-        q, _ = self._e_step(logits, groups, k, labelled)
-        z = self._map(logits, groups, k, labelled)
+        q, _ = self._e_step(logits, groups, k, labelled, fixed)
+        z = self._map(logits, groups, k, labelled, fixed)
         prob = np.full(n, base)
         for it in range(self.s.max_iter):
             for train, test in splits:
@@ -283,11 +324,11 @@ class CountConstrainedEM:
                 clf = fit_soft(X[tr], q[tr], self.s.clf_params, weight[tr])
                 prob[test] = clf.predict_proba(X[test])[:, 1]
             logits = _logit(prob)
-            q, post = self._e_step(logits, groups, k, labelled)
+            q, post = self._e_step(logits, groups, k, labelled, fixed)
             if self.s.estimate_prior and post.sum() > 0:
                 counts = post + self.s.prior_strength * self.prior0
                 self.log_prior_m = np.log(counts / counts.sum())
-            z_new = self._map(logits, groups, k, labelled)
+            z_new = self._map(logits, groups, k, labelled, fixed)
             changed = int((z_new != z).sum())
             z = z_new
             moved = int((labelled & ~z).sum())

@@ -26,7 +26,7 @@
 
 root: null
 
-# Address-level labels: which addresses are private dwellings (PD) and which are out of scope.
+# Address-level labels: the private dwelling (PD) addresses. Every other address is taken as not PD.
 # Only the parcel-level count of PD labels is trusted; the model decides which addresses they belong to.
 labelled_asset:
   path: null
@@ -35,10 +35,10 @@ labelled_asset:
   columns:
     address_pid: address_detail_pid
     label: label
-  # Label values (case-insensitive). Quote them: YAML reads bare YES / NO / TRUE as booleans.
+  # Values meaning PD (case-insensitive). Quote them: YAML reads bare YES / TRUE as booleans.
+  # Rows with any other value, and every address not in this table, are taken as not PD.
+  # Leave columns.label null if the table only lists PD addresses.
   pd_values: ["PD", "1", "Y", "YES", "TRUE", "PRIVATE DWELLING"]
-  oos_values: ["OOS", "0", "N", "NO", "FALSE", "OUT OF SCOPE", "NPD"]
-  # Anything else (blank, unknown codes) is treated as unlabelled.
 
 # Every address, G-NAF style: one row per address with its components and a geocode.
 ds_asset:

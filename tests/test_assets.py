@@ -85,11 +85,25 @@ def test_label_values_and_numeric_labels(tmp_path):
         "path": str(tmp_path / "labels.parquet"), "columns": {"address_pid": "gnaf_id", "label": "status"},
         "pd_values": ["private dwelling", "1"], "oos_values": ["non-private"]}})["labelled_asset"]
     lab = load_label_table(spec, log=lambda m: None)
-    assert dict(zip(lab["address_pid"], lab["y"])) == {"A": 1, "B": 0, "C": 1, "D": -1, "E": -1}
+    assert lab["address_pid"].to_list() == ["A", "C"] and (lab["y"] == 1).all()   # the rest: not PD
     pl.DataFrame({"address_detail_pid": ["A", "B"], "is_pd": [True, False]}).write_parquet(tmp_path / "flags.parquet")
     spec = datasets_config(None, {"labelled_asset": {"path": str(tmp_path / "flags.parquet"),
                                                      "columns": {"label": "is_pd"}}})["labelled_asset"]
-    assert load_label_table(spec, log=lambda m: None)["y"].to_list() == [1, 0]
+    assert load_label_table(spec, log=lambda m: None)["address_pid"].to_list() == ["A"]
+
+
+def test_labels_without_a_flag_column_are_all_pd(tmp_path):
+    pl.DataFrame({"address_detail_pid": ["A", "B", "B"]}).write_parquet(tmp_path / "pd.parquet")
+    spec = datasets_config(None, {"labelled_asset": {"path": str(tmp_path / "pd.parquet")}})["labelled_asset"]
+    assert load_label_table(spec, log=lambda m: None)["address_pid"].to_list() == ["A", "B"]
+    assert "every row is a PD" in check_datasets({"labelled_asset": spec})
+
+
+def test_labels_with_no_true_flag_are_an_error(tmp_path):
+    pl.DataFrame({"address_detail_pid": ["A", "B"], "label": ["N", "N"]}).write_parquet(tmp_path / "none.parquet")
+    spec = datasets_config(None, {"labelled_asset": {"path": str(tmp_path / "none.parquet")}})["labelled_asset"]
+    with pytest.raises(ValueError, match="no row has a PD value"):
+        load_label_table(spec, log=lambda m: None)
 
 
 def test_ds_asset_view_matches_the_gnaf_release(synth):

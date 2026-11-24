@@ -71,7 +71,7 @@ import polars as pl
 from shell_identifier import verify_frames, check_frames
 
 frames = dict(
-    labelled_asset=pl.scan_parquet("D:/data/pd_labels.parquet"),   # ADDRESS_ID, PD_FLAG
+    labelled_asset=pl.scan_parquet("D:/data/pd_labels.parquet"),   # ADDRESS_ID, PD_FLAG (the PD addresses)
     ds_asset=pl.scan_parquet("D:/data/addresses.parquet"),         # ADDRESS_ID, G-NAF fields, LATITUDE, LONGITUDE
     cad=pl.scan_csv("D:/data/cadastre_base.csv"),                  # cadastre_polygon_pid, parcel_id, WKT
     bld=pl.scan_csv("D:/data/buildings.csv"),                      # building_pid, WKT
@@ -84,13 +84,13 @@ result["moves"]                      # PD labels moved to another address (the r
 
 Defaults for this layout:
 - **Keys:** `ADDRESS_ID` is the address key in both the labels and `ds_asset`.
-- **Labels:** `PD_FLAG` values `PD/Y/YES/1/TRUE` mean dwelling, and `OOS/N/NO/0/FALSE` mean out of scope. A boolean or 0/1 column works too.
+- **Labels:** `labelled_asset` lists the PD addresses. Rows whose `PD_FLAG` is `TRUE/1/Y/YES/PD` (a boolean or 0/1 column works too) are dwellings. Rows with any other value are ignored, and so is the flag column itself if there isn't one (every row is then a PD). Every `ds_asset` address that isn't flagged is taken as not PD, so a parcel's dwelling count is its number of PD flags, which can be zero. `ds_asset` should therefore cover the same area as the labels: an unlabelled suburb would be read as having no dwellings.
 - **Address fields:** G-NAF names are found case-insensitively (`FLAT_TYPE_CODE` or `FLAT_TYPE`, `NUMBER_FIRST`, `STREET_NAME`, `STATE_ABBREVIATION`, …), as are `LATITUDE`/`LONGITUDE` (or `LAT`/`LON`/`LONG`).
 - **Parcels:** `parcel_id` is the parcel key, and polygons that share it are parts of one parcel. `cadastre_polygon_pid` is used where `parcel_id` is empty, and every polygon is treated as a base parcel.
 - **Geometry:** WKT columns are found by name (`WKT`, `GEOM_WKT`, `SHAPE`, …) or by their content. EWKT (`SRID=…;`) and WKB also work.
 - **CRS:** `EPSG:7844` (GDA2020 lon/lat) is the default. Pass `crs="EPSG:4283"` for GDA94, or `crs={"cad": "EPSG:7856"}` for projected WKT. Lon/lat swapped, or projected coordinates labelled as lon/lat, stop the run with an explanation.
 
-Override any name with `columns={"ds_asset": {"latitude": "Y"}, "cad": {"geometry": "GEOM_TEXT"}}`, and the label values with `pd_values=` / `oos_values=`. Optional inputs are `counts=` (a frame of `parcel_id, n_dwellings` with trusted counts), and the `bld_address=` / `bld_cadastre=` link tables. Any extra columns the pipeline knows are used when present, such as `LEGAL_PARCEL_ID`, `PRIMARY_SECONDARY`, `GEOCODE_TYPE_CODE`, building `total_floor_area` / `roof_height` / `building_use`, and cadastre strata counts. Features with no data are left out of the model and listed in the log.
+Override any name with `columns={"ds_asset": {"latitude": "Y"}, "cad": {"geometry": "GEOM_TEXT"}}`, and the values that mean PD with `pd_values=`. Optional inputs are `counts=` (a frame of `parcel_id, n_dwellings` with trusted counts), and the `bld_address=` / `bld_cadastre=` link tables. Any extra columns the pipeline knows are used when present, such as `LEGAL_PARCEL_ID`, `PRIMARY_SECONDARY`, `GEOCODE_TYPE_CODE`, building `total_floor_area` / `roof_height` / `building_use`, and cadastre strata counts. Features with no data, or too little to use, are left out of the model and listed in the log. "Too little" means fewer than about 30 expected values in the 200,000-row sample that scikit-learn bins from, on runs with more rows than that.
 
 `predict_frames(result["bundle"], ds_asset=..., cad=..., bld=...)` applies the fitted model to unlabelled areas, and `score_frames(...)` runs the label-free shell scorer. The same files can be named on the command line instead, for example `--labelled-asset pd_labels.parquet --ds-asset addresses.parquet --cad cadastre_base.csv --bld buildings.csv`.
 
@@ -123,7 +123,7 @@ bld:            {table: geoscape_buildings}
 cad:            {table: geoscape_cadastre}
 ```
 
-Each `path` can be a file (`.parquet`, `.csv`, `.psv`, `.arrow`, `.gpkg`, `.shp`, `.fgb`, …), a folder (the table is `<folder>/<table>.<ext>` or a folder of parquet parts `<folder>/<table>/`), a GeoPackage, FileGDB or SQLite database (the table is the layer), or a glob or object-store URI that polars can scan. Column mappings are `canonical: your_column`, matched case-insensitively. If a name isn't found, the usual G-NAF and Geoscape names and the 10-character shapefile aliases are tried. `filter:` takes an SQL predicate on the source columns, for example `"state_abbreviation = 'NSW'"`. Geometry can be WKB (binary or hex), WKT or GeoParquet. Flat, level and geocode types can be codes (`APT`, `L`, `PC`) or names (`APARTMENT`, `LEVEL`, `PROPERTY CENTROID`). For `labelled_asset`, set `pd_values` / `oos_values` to your label codes. Any other value is treated as unlabelled, and the run log lists which values it saw.
+Each `path` can be a file (`.parquet`, `.csv`, `.psv`, `.arrow`, `.gpkg`, `.shp`, `.fgb`, …), a folder (the table is `<folder>/<table>.<ext>` or a folder of parquet parts `<folder>/<table>/`), a GeoPackage, FileGDB or SQLite database (the table is the layer), or a glob or object-store URI that polars can scan. Column mappings are `canonical: your_column`, matched case-insensitively. If a name isn't found, the usual G-NAF and Geoscape names and the 10-character shapefile aliases are tried. `filter:` takes an SQL predicate on the source columns, for example `"state_abbreviation = 'NSW'"`. Geometry can be WKB (binary or hex), WKT or GeoParquet. Flat, level and geocode types can be codes (`APT`, `L`, `PC`) or names (`APARTMENT`, `LEVEL`, `PROPERTY CENTROID`). For `labelled_asset`, set `pd_values` to the codes that mean PD. Rows with any other value are taken as not PD, and the run log lists which values it saw.
 
 **2. Check it against the data.** This shows where each dataset resolved to, its row count and CRS, and which column each field maps to:
 
@@ -306,7 +306,7 @@ Buildings turn about 60 UNCERTAIN suffix and duplex cases into confident answers
 
 ## Dwelling model from labelled data
 
-Use this when you have address labels of **PD** (private dwelling) or **out of scope**, where each parcel's number of PDs is right but a label is sometimes on the wrong address. Typical mistakes are `20 X ST` instead of `UNIT 5, 20 X ST`, or `10` instead of `10B`.
+Use this when you have a list of **PD** (private dwelling) addresses, with every other address out of scope, where each parcel's number of PDs is right but a label is sometimes on the wrong address. Typical mistakes are `20 X ST` instead of `UNIT 5, 20 X ST`, or `10` instead of `10B`.
 
 ```bash
 shell-identifier dwellings verify --datasets datasets.yaml --out results/dwellings
@@ -317,7 +317,7 @@ shell-identifier dwellings verify --datasets datasets.yaml --out results/dwellin
 shell-identifier dwellings predict --model results/dwellings/dwelling_model.joblib --datasets datasets.yaml --out results/predicted
 ```
 
-`labelled_asset` needs an address id and a label. The defaults are `address_detail_pid` and `label`; change them in the datasets YAML, or with `--labels-id` / `--label-col`. Values `PD/1/Y/YES/TRUE` mean dwelling, and `OOS/0/N/NO/FALSE` mean out of scope; override them with `pd_values` / `oos_values` (or `--pd-values` / `--oos-values`). Boolean and 0/1 label columns work as they are. Addresses missing from the labels are treated as unlabelled candidates. A parcel's dwelling count is its number of PD labels, unless you give trusted counts as `parcel_counts` (`--counts`).
+`labelled_asset` needs an address id, and optionally a PD flag. The defaults are `address_detail_pid` and `label`; change them in the datasets YAML, or with `--labels-id` / `--label-col`. Rows flagged `PD/1/Y/YES/TRUE` are dwellings; set other codes with `pd_values` (or `--pd-values`). Boolean and 0/1 columns work as they are. Rows with any other value are ignored. Without a flag column, every row is a PD. Every address not flagged PD is out of scope, so every parcel is checked: its dwelling count is its number of PD labels, which may be zero, unless you give trusted counts as `parcel_counts` (`--counts`).
 
 ### How it works
 

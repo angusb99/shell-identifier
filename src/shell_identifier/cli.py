@@ -64,7 +64,6 @@ def _datasets(args) -> dict:
     _set(over, "labelled_asset", "columns.address_pid", g("labels_id"))
     _set(over, "labelled_asset", "columns.label", g("label_col"))
     _set(over, "labelled_asset", "pd_values", g("pd_values"))
-    _set(over, "labelled_asset", "oos_values", g("oos_values"))
     _set(over, "parcel_counts", "path", g("counts"))
     for item in g("table") or []:
         role, _, name = item.partition("=")
@@ -311,8 +310,7 @@ def _dataset_args(p: argparse.ArgumentParser, labels: bool = False) -> None:
     if labels:
         o.add_argument("--labels-id", help="address id column of labelled_asset")
         o.add_argument("--label-col", help="label column of labelled_asset")
-        o.add_argument("--pd-values", nargs="+", help="label values meaning private dwelling")
-        o.add_argument("--oos-values", nargs="+", help="label values meaning out of scope")
+        o.add_argument("--pd-values", nargs="+", help="label values meaning private dwelling (others: not PD)")
 
 
 def _model_args(p: argparse.ArgumentParser) -> None:

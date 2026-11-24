@@ -5,7 +5,7 @@ yourself (``pl.scan_parquet``, ``pl.scan_csv`` ...). Only the needed columns are
 collected. The default column names follow this layout:
 
 =================  ===================================================================
-``labelled_asset`` ``ADDRESS_ID``, ``PD_FLAG``
+``labelled_asset`` ``ADDRESS_ID``, ``PD_FLAG`` (optional): the PD addresses; every other address is not PD
 ``ds_asset``       ``ADDRESS_ID``, G-NAF address fields (``FLAT_TYPE_CODE`` / ``FLAT_TYPE``,
                    ``FLAT_NUMBER``, ``LEVEL_*``, ``NUMBER_FIRST``, ``STREET_NAME`` ...),
                    ``LATITUDE`` / ``LONGITUDE`` (or ``LAT`` / ``LON`` / ``LONG``)
@@ -56,10 +56,13 @@ FRAME_COLUMNS: dict[str, dict] = {
 def frame_datasets(labelled_asset: FrameLike | None = None, ds_asset: FrameLike | None = None,
                    cad: FrameLike | None = None, bld: FrameLike | None = None, *,
                    counts: FrameLike | None = None, crs: str | dict = "EPSG:7844",
-                   columns: dict[str, dict] | None = None, pd_values=None, oos_values=None,
+                   columns: dict[str, dict] | None = None, pd_values=None,
                    bld_address: FrameLike | None = None, bld_cadastre: FrameLike | None = None) -> dict:
     """A datasets dict (as from a datasets YAML) whose sources are the given frames.
 
+    ``labelled_asset`` holds the PD addresses: rows whose ``PD_FLAG`` is true (``pd_values``,
+    default PD / 1 / Y / YES / TRUE, or a boolean column) are PD, every other address is not.
+    Without a ``PD_FLAG`` column every row is a PD.
     ``crs`` is the CRS of the coordinates / WKT (one string, or ``{"cad": ..., "bld": ...}``).
     ``columns`` overrides column names per dataset: ``{role: {canonical: your_column}}``.
     """
@@ -73,8 +76,6 @@ def frame_datasets(labelled_asset: FrameLike | None = None, ds_asset: FrameLike 
             over[role]["crs"] = crs.get(role, "EPSG:7844") if isinstance(crs, dict) else crs
     if pd_values is not None:
         over["labelled_asset"]["pd_values"] = list(pd_values)
-    if oos_values is not None:
-        over["labelled_asset"]["oos_values"] = list(oos_values)
     ds = datasets_config(None, over)
     for role, frame in frames.items():
         if frame is not None:
@@ -110,7 +111,10 @@ def verify_frames(*, labelled_asset: FrameLike, ds_asset: FrameLike, cad: FrameL
                   counts: FrameLike | None = None, out_dir: str | Path | None = None, settings=None,
                   cfg: dict | None = None, write_features: bool = False, gpkg: bool = True,
                   log: Callable = print, **kw) -> dict:
-    """Fit the dwelling model on the labelled parcels, move misplaced PD labels, find primary shells.
+    """Fit the dwelling model, move misplaced PD labels to the right address, find primary shells.
+
+    Every ``ds_asset`` address without a true ``PD_FLAG`` is taken as not PD, so
+    ``ds_asset`` should cover the same area as the labels.
 
     Returns the result dict (``assignments``, ``parcels``, ``moves``, ``bundle`` ...); with
     ``out_dir`` the usual CSV / parquet / GeoPackage / model files are written there too

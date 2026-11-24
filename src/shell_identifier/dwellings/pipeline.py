@@ -7,8 +7,15 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from ..frames import c, int_text, join_nonempty, left_join, lookup, markdown_table
-from .countem import CountConstrainedEM, EMSettings, _logit, conditional_marginals
+from ..frames import c, int_text, join_nonempty, lookup, markdown_table
+from .countem import (
+    CountConstrainedEM,
+    EMSettings,
+    _logit,
+    as_matrix,
+    conditional_marginals,
+    usable_columns,
+)
 from .features import dwelling_features
 from .labels import parcel_counts
 from .roles import DWELLING, OOS, PRIMARY, SUB, assign_roles, pair_moves
@@ -56,37 +63,48 @@ def _prepare(ctx: dict) -> tuple[pl.DataFrame, pl.DataFrame]:
 
 
 def _with_labels(s: pl.DataFrame, labels: pl.DataFrame | None) -> pl.DataFrame:
+    """``y`` = 1 for addresses labelled PD and 0 for every other address (-1 throughout without labels)."""
     s = s.drop([k for k in ("y", "input_label") if k in s.columns])
-    if labels is None or labels.is_empty():
+    if labels is None:
         return s.with_columns(y=pl.lit(-1, dtype=pl.Int64), input_label=pl.lit(""))
-    lab = labels.select(c("address_pid").cast(pl.Utf8), "y", c("label_raw").alias("input_label"))
-    return left_join(s, lab, "address_pid").with_columns(c("y").fill_null(-1), c("input_label").fill_null(""))
+    is_pd = c("address_pid").is_in(labels.filter(c("y") == 1)["address_pid"].cast(pl.Utf8).implode())
+    return s.with_columns(y=is_pd.cast(pl.Int64), input_label=pl.when(is_pd).then(pl.lit("PD")).otherwise(pl.lit("OOS")))
 
 
 def verify(ctx: dict, labels: pl.DataFrame, settings: EMSettings | None = None,
            counts: pl.DataFrame | None = None, log=print) -> dict:
-    """Fit the count-constrained model on labelled parcels and assign dwellings and shells.
+    """Fit the count-constrained model and assign dwellings and shells.
 
-    Parcels with labels get exactly their labelled number of dwellings (cross-fitted
-    posteriors); parcels without labels are predicted by the final model.
+    ``labels`` are the PD addresses; every other address is taken as not PD, so a
+    parcel's dwelling count is its number of PD labels (or ``counts`` where given).
+    Each parcel gets exactly that many dwellings (cross-fitted posteriors); addresses
+    that matched no parcel are predicted by the final model.
     """
     s, F = _prepare(ctx)
     s = _with_labels(s, labels)
+    n_pd = int((s["y"] == 1).sum())
+    if not n_pd:
+        raise ValueError("no PD label matched an address; check that the label ids are the ds_asset address ids")
+    if labels.height > n_pd:
+        log(f"{labels.height - n_pd:,} PD labels have an address id that is not in ds_asset and are ignored")
     k = parcel_counts(s, counts)
     k_map = dict(zip(k["parcel_pid"].to_list(), k["k"].to_list()))
     train = (s["parcel_pid"].is_in(k["parcel_pid"].implode()) & (s["parcel_pid"] != "")).to_numpy()
     if not train.any():
-        raise ValueError("no labelled address could be matched to a parcel; check the address id column")
-    log(f"{int(train.sum()):,} addresses on {k.height:,} labelled parcels; {int((s['y'] == 1).sum()):,} PD labels")
+        raise ValueError("no address could be matched to a parcel; check the coordinates and the cadastre")
+    n_pd_parcel = int((s["y"] == 1).filter(pl.Series(train)).sum())
+    log(f"{int(train.sum()):,} addresses on {k.height:,} parcels ({int((k['k'] > 0).sum()):,} with a PD label); "
+        f"{n_pd:,} PD labels, {n_pd - n_pd_parcel:,} of them on addresses outside every parcel; "
+        f"all other addresses are taken as not PD")
 
-    # Features with no value on any labelled address (e.g. storeys without floor area or roof height,
-    # strata counts without strata parcels) carry no information and break histogram binning.
-    has_data = F.filter(pl.Series(train)).select(pl.all().is_not_null().any()).row(0, named=True)
-    empty = [k for k, ok in has_data.items() if not ok]
-    if empty:
-        log(f"{len(empty)} features have no data and are left out: {', '.join(empty)}")
-    F_all, F = F, F.select([k for k, ok in has_data.items() if ok])
-    X = F.to_numpy()
+    # Features with no value (or too few values) on the parcels, e.g. storeys without floor area or
+    # roof height, carry no information and break histogram binning.
+    X = as_matrix(F)
+    ok = usable_columns(X[train])
+    if not ok.all():
+        dropped = [name for name, keep in zip(F.columns, ok) if not keep]
+        log(f"{len(dropped)} features have no data (or too little to use) and are left out: {', '.join(dropped)}")
+    F_all, F, X = F, F.select([name for name, keep in zip(F.columns, ok) if keep]), X[:, ok]
     parcel = s["parcel_pid"].to_numpy()
     y = s["y"].to_numpy()
     em = CountConstrainedEM(settings).fit(X[train], parcel[train], k_map, y[train], log=log)
@@ -112,8 +130,8 @@ def verify(ctx: dict, labels: pl.DataFrame, settings: EMSettings | None = None,
 def predict(ctx: dict, bundle: dict, counts: pl.DataFrame | None = None) -> dict:
     """Apply a saved model. With ``counts`` (parcel_pid, n_dwellings) those parcels get exactly that many."""
     s, F = _prepare(ctx)
-    X = F.select([c(k) if k in F.columns else pl.lit(None, dtype=pl.Float64).alias(k)
-                  for k in bundle["features"]]).to_numpy()
+    X = as_matrix(F.select([c(k) if k in F.columns else pl.lit(None, dtype=pl.Float64).alias(k)
+                            for k in bundle["features"]]))
     prob = bundle["model"].predict_proba(X)[:, 1]
     post, assigned = prob.copy(), prob >= 0.5
     mode = np.full(s.height, "predicted", dtype=object)
@@ -153,7 +171,6 @@ def _finish(s: pl.DataFrame, F: pl.DataFrame) -> dict:
         rank_in_parcel=rank.cast(pl.Int64),
         label_change=pl.when((y == 1) & ~assigned).then(pl.lit("PD->OOS"))
         .when((y == 0) & assigned).then(pl.lit("OOS->PD"))
-        .when((y == -1) & assigned & (c("mode") == "verified")).then(pl.lit("unlabelled->PD"))
         .otherwise(pl.lit("")),
     )
     n_parcel = pl.len().over("parcel_pid").cast(pl.Utf8)
@@ -252,7 +269,7 @@ def feature_importance(result: dict, max_rows: int = 8000, seed: int = 0) -> pl.
     y = s["assigned_dwelling"].to_numpy()[rows].astype(int)
     if len(np.unique(y)) < 2:
         return pl.DataFrame({"feature": [], "importance": []}, schema={"feature": pl.Utf8, "importance": pl.Float64})
-    imp = permutation_importance(result["bundle"]["model"], F.to_numpy()[rows], y, scoring="neg_log_loss",
+    imp = permutation_importance(result["bundle"]["model"], as_matrix(F)[rows], y, scoring="neg_log_loss",
                                  n_repeats=2, random_state=seed)
     return pl.DataFrame({"feature": F.columns, "importance": imp.importances_mean}).sort("importance", descending=True)
 
@@ -264,9 +281,10 @@ def model_report(result: dict) -> str:
     role_counts = ", ".join(f"{r} {int((s['role'] == r).sum()):,}" for r in (DWELLING, PRIMARY, SUB, OOS))
     lines = [
         "# Dwelling model report", "",
-        f"* Labelled parcels: {v.height:,} ({int((v['n_addresses'] > 1).sum()):,} with more than one address)",
-        f"* PD labels: {int((s['y'] == 1).sum()):,}; out of scope: {int((s['y'] == 0).sum()):,}; "
-        f"unlabelled on labelled parcels: {int(((s['y'] == -1) & (s['mode'] == 'verified')).sum()):,}",
+        (f"* Parcels checked against their PD count: {v.height:,} "
+         f"({int((v['n_addresses'] > 1).sum()):,} with more than one address)"),
+        f"* PD labels: {int((s['y'] == 1).sum()):,}; other addresses (taken as not PD): "
+        f"{int((s['y'] == 0).sum()):,}",
         f"* PD labels moved to another address: **{int((s['label_change'] == 'PD->OOS').sum()):,}** "
         f"on {int((v['n_label_changes'] > 0).sum()):,} parcels",
         f"* Parcels flagged for review (margin < 0.3): {int(v['review'].sum()):,}",
